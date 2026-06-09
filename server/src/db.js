@@ -37,58 +37,66 @@ if (TURSO_URL) {
 }
 try { db.pragma("foreign_keys = ON"); } catch (_) {}
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS users (
+// Run each statement on its own — libsql does NOT support a multi-statement
+// string in a single exec() over a Turso embedded replica (it raises
+// "cannot rollback - no transaction is active").
+const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
     display_name  TEXT NOT NULL,
     points        INTEGER NOT NULL DEFAULT 100,
     created_at    TEXT NOT NULL DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS matches (
+  )`,
+  `CREATE TABLE IF NOT EXISTS matches (
     id         INTEGER PRIMARY KEY,
     "group"    TEXT,
     team1      TEXT NOT NULL,
     team2      TEXT NOT NULL,
     match_date TEXT,
     venue      TEXT,
-    status     TEXT NOT NULL DEFAULT 'upcoming',  -- upcoming | live | finished
-    result     TEXT                               -- team1 | draw | team2 | NULL
-  );
-
-  CREATE TABLE IF NOT EXISTS bets (
+    status     TEXT NOT NULL DEFAULT 'upcoming',
+    result     TEXT
+  )`,
+  `CREATE TABLE IF NOT EXISTS bets (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id        INTEGER NOT NULL,
     match_id       INTEGER NOT NULL,
-    bet_choice     TEXT NOT NULL,                 -- team1 | draw | team2
+    bet_choice     TEXT NOT NULL,
     points_wagered INTEGER NOT NULL,
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (user_id, match_id),
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (match_id) REFERENCES matches(id)
-  );
-
-  CREATE TABLE IF NOT EXISTS payouts (
+  )`,
+  `CREATE TABLE IF NOT EXISTS payouts (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     bet_id         INTEGER NOT NULL,
     points_awarded INTEGER NOT NULL,
     settled_at     TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (bet_id) REFERENCES bets(id)
-  );
-`);
+  )`,
+];
+for (const stmt of SCHEMA) db.exec(stmt);
 
 // Seed all 104 matches on first run (writes forward to the Turso primary when
 // configured, so this only happens once across all deploys).
 const matchCount = db.prepare("SELECT COUNT(*) AS c FROM matches").get().c;
 if (matchCount === 0) {
+  // INSERT OR IGNORE keeps this safe to re-run; the transaction is a fast path,
+  // with a row-by-row fallback if the backend doesn't support it.
   const insert = db.prepare(`
-    INSERT INTO matches (id, "group", team1, team2, match_date, venue, status, result)
+    INSERT OR IGNORE INTO matches (id, "group", team1, team2, match_date, venue, status, result)
     VALUES (@id, @group, @team1, @team2, @match_date, @venue, @status, @result)
   `);
-  const seed = db.transaction((rows) => rows.forEach((r) => insert.run(r)));
-  seed(SEED_MATCHES);
+  try {
+    const seed = db.transaction((rows) => rows.forEach((r) => insert.run(r)));
+    seed(SEED_MATCHES);
+  } catch (e) {
+    console.warn("[db] transactional seed unavailable, inserting row-by-row:", e.message);
+    for (const r of SEED_MATCHES) insert.run(r);
+  }
   console.log(`[db] Seeded ${SEED_MATCHES.length} matches`);
 }
 
