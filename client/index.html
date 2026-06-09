@@ -506,9 +506,17 @@
               <div className="grid gap-3 sm:grid-cols-2">
                 {ms.map((m, i) => {
                   const api = apiIndex[`${m.a}|${m.b}|${m.date}|${m.time}`];
+                  // Always open the modal; if the backend record isn't loaded
+                  // (server offline / still loading) pass a synthetic match so
+                  // the window still opens and explains what's wrong.
+                  const open = api || {
+                    id: null, group: m.grp, team1: m.a, team2: m.b,
+                    match_date: `${m.date}T${m.time}:00`,
+                    venue: `${m.venue}, ${m.city}`, status: "upcoming", result: null,
+                  };
                   const finished = api && api.status === "finished";
                   return (
-                  <div key={i} onClick={() => api && onOpenMatch(api)}
+                  <div key={i} onClick={() => onOpenMatch(open)}
                     className="bg-white rounded-xl border border-pitch-100 shadow-sm p-4 hover:shadow-md hover:border-pitch-300 transition cursor-pointer">
                     <div className="flex items-center justify-between mb-3">
                       <div className="flex items-center gap-2">
@@ -866,6 +874,7 @@
       const [err, setErr] = useState("");
       const [busy, setBusy] = useState(false);
 
+      const online = match.id != null; // false when the backend record isn't loaded
       const load = async () => {
         try {
           const mkt = await apiFetch(`/bets/match/${match.id}`);
@@ -874,7 +883,7 @@
           setMyBet(mine.bets.find(b => b.match_id === match.id) || null);
         } catch (e) { setErr(e.message); }
       };
-      useEffect(() => { load(); }, [match.id]);
+      useEffect(() => { if (online) load(); else setMyBet(null); }, [match.id]);
 
       const placeBet = async (e) => {
         e.preventDefault();
@@ -889,7 +898,7 @@
         } catch (e) { setErr(e.message); } finally { setBusy(false); }
       };
 
-      const canBet = match.status === "upcoming";
+      const canBet = online && match.status === "upcoming";
       const statusChip = {
         upcoming: "bg-pitch-100 text-pitch-700",
         live: "bg-amber-100 text-amber-700",
@@ -925,13 +934,22 @@
             </div>
 
             <div className="p-4 space-y-5">
+              {!online && (
+                <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl p-3 text-sm">
+                  ⚠️ Can't reach the server, so live odds and betting aren't available right now.
+                  Make sure the backend is running, then reopen this match.
+                </div>
+              )}
               {/* Betting market */}
+              {online && (
               <section>
                 <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold mb-2">Betting market</h3>
                 <MarketBar market={market} match={match} />
               </section>
+              )}
 
               {/* My existing bet OR place-bet form */}
+              {online && (
               <section>
                 {myBet === undefined ? (
                   <p className="text-sm text-pitch-400">Loading…</p>
@@ -973,6 +991,7 @@
                   </form>
                 )}
               </section>
+              )}
             </div>
           </div>
         </div>
