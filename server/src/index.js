@@ -98,35 +98,46 @@ app.patch("/api/matches/:id/result", adminRequired, (req, res) => {
   res.json({ match: updated, settlement });
 });
 
-// Payout engine — runs inside one transaction.
-const settleMatch = db.transaction((matchId, result) => {
-  db.prepare("UPDATE matches SET result = ?, status = 'finished' WHERE id = ?").run(result, matchId);
-
+// Payout engine. Plain sequential writes (no db.transaction — interactive
+// transactions don't reliably persist on a Turso embedded replica). It's made
+// idempotent instead: a bet is never paid twice, and the match is marked
+// finished LAST, so a crash mid-settle leaves it safely re-runnable.
+function settleMatch(matchId, result) {
   const bets = db.prepare("SELECT * FROM bets WHERE match_id = ?").all(matchId);
   const total_pool = bets.reduce((s, b) => s + b.points_wagered, 0);
   const winningBets = bets.filter((b) => b.bet_choice === result);
 
+  const alreadyPaid = new Set(
+    db.prepare("SELECT bet_id FROM payouts WHERE bet_id IN (SELECT id FROM bets WHERE match_id = ?)")
+      .all(matchId)
+      .map((r) => r.bet_id)
+  );
   const insertPayout = db.prepare("INSERT INTO payouts (bet_id, points_awarded) VALUES (?, ?)");
   const addPoints = db.prepare("UPDATE users SET points = points + ? WHERE id = ?");
+  const pay = (betId, userId, amount) => {
+    if (alreadyPaid.has(betId)) return; // idempotent — never pay the same bet twice
+    insertPayout.run(betId, amount);
+    addPoints.run(amount, userId);
+  };
 
-  // No winners → refund every bettor their original stake.
+  let settlement;
   if (winningBets.length === 0) {
-    for (const b of bets) {
-      insertPayout.run(b.id, b.points_wagered);
-      addPoints.run(b.points_wagered, b.user_id);
+    // No winners → refund every bettor their original stake.
+    for (const b of bets) pay(b.id, b.user_id, b.points_wagered);
+    settlement = { total_pool, winners: 0, refunded: bets.length, mode: "refund" };
+  } else {
+    // Winners share the whole pool proportionally to their stake.
+    const total_winning_pool = winningBets.reduce((s, b) => s + b.points_wagered, 0);
+    for (const b of winningBets) {
+      const award = Math.round((b.points_wagered / total_winning_pool) * total_pool);
+      pay(b.id, b.user_id, award);
     }
-    return { total_pool, winners: 0, refunded: bets.length, mode: "refund" };
+    settlement = { total_pool, winners: winningBets.length, total_winning_pool, mode: "payout" };
   }
 
-  // Winners share the whole pool proportionally to their stake.
-  const total_winning_pool = winningBets.reduce((s, b) => s + b.points_wagered, 0);
-  for (const b of winningBets) {
-    const award = Math.round((b.points_wagered / total_winning_pool) * total_pool);
-    insertPayout.run(b.id, award);
-    addPoints.run(award, b.user_id);
-  }
-  return { total_pool, winners: winningBets.length, total_winning_pool, mode: "payout" };
-});
+  db.prepare("UPDATE matches SET result = ?, status = 'finished' WHERE id = ?").run(result, matchId);
+  return settlement;
+}
 
 // ---------------------------------------------------------------------------
 // Bets
@@ -151,14 +162,13 @@ app.post("/api/bets", authRequired, (req, res) => {
   const fresh = db.prepare("SELECT points FROM users WHERE id = ?").get(req.user.id);
   if (wager > fresh.points) return res.status(400).json({ error: "Not enough points" });
 
-  const place = db.transaction(() => {
-    db.prepare("UPDATE users SET points = points - ? WHERE id = ?").run(wager, req.user.id);
-    const info = db
-      .prepare("INSERT INTO bets (user_id, match_id, bet_choice, points_wagered) VALUES (?, ?, ?, ?)")
-      .run(req.user.id, match_id, bet_choice, wager);
-    return info.lastInsertRowid;
-  });
-  const betId = place();
+  // Direct writes (no db.transaction — see db.js note on Turso replicas).
+  // Insert the bet first: if it fails (e.g. duplicate), no points are deducted.
+  const info = db
+    .prepare("INSERT INTO bets (user_id, match_id, bet_choice, points_wagered) VALUES (?, ?, ?, ?)")
+    .run(req.user.id, match_id, bet_choice, wager);
+  const betId = info.lastInsertRowid;
+  db.prepare("UPDATE users SET points = points - ? WHERE id = ?").run(wager, req.user.id);
 
   const bet = db.prepare("SELECT * FROM bets WHERE id = ?").get(betId);
   const balance = db.prepare("SELECT points FROM users WHERE id = ?").get(req.user.id).points;

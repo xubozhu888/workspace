@@ -1152,10 +1152,29 @@
       }, []);
 
       // Once logged in, load all matches for the schedule / betting.
-      useEffect(() => {
-        if (!user) return;
-        apiFetch("/matches").then(d => setApiMatches(d.matches)).catch(() => {});
-      }, [user]);
+      // Retries a few times so a sleeping free-tier backend (Render cold start)
+      // self-heals, and surfaces a real message instead of failing silently.
+      const [matchesError, setMatchesError] = useState("");
+      const loadMatches = async (attempt = 0) => {
+        try {
+          const d = await apiFetch("/matches");
+          const list = d.matches || [];
+          setApiMatches(list);
+          setMatchesError(
+            list.length === 0
+              ? "The server is reachable but returned no matches — the database may not be seeded yet."
+              : ""
+          );
+        } catch (e) {
+          if (attempt < 4) {
+            setMatchesError("Waking up the server… (retrying)");
+            setTimeout(() => loadMatches(attempt + 1), 2500 * (attempt + 1));
+          } else {
+            setMatchesError(`Couldn't load match data from the server: ${e.message}`);
+          }
+        }
+      };
+      useEffect(() => { if (user) loadMatches(0); }, [user]);
 
       // Index API matches by team1|team2|date|time so the hardcoded schedule
       // cards can find their backend record (id, status, result).
@@ -1218,6 +1237,14 @@
               </nav>
             </div>
           </header>
+
+          {/* Match-data connectivity banner */}
+          {matchesError && (
+            <div className="bg-amber-50 border-b border-amber-200 text-amber-800 text-sm px-4 py-2 text-center">
+              ⚠️ {matchesError}
+              <button onClick={() => loadMatches(0)} className="underline font-semibold ml-2">Retry</button>
+            </div>
+          )}
 
           {/* Body */}
           <main className="max-w-[1400px] mx-auto px-4 py-4">

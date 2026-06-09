@@ -84,20 +84,19 @@ for (const stmt of SCHEMA) db.exec(stmt);
 // configured, so this only happens once across all deploys).
 const matchCount = db.prepare("SELECT COUNT(*) AS c FROM matches").get().c;
 if (matchCount === 0) {
-  // INSERT OR IGNORE keeps this safe to re-run; the transaction is a fast path,
-  // with a row-by-row fallback if the backend doesn't support it.
+  // Direct INSERTs only — do NOT wrap in db.transaction(): interactive
+  // transactions do not reliably persist on a Turso embedded replica (they
+  // silently write nothing), while plain INSERTs forward to the primary fine.
+  // INSERT OR IGNORE keeps this safe to re-run.
   const insert = db.prepare(`
     INSERT OR IGNORE INTO matches (id, "group", team1, team2, match_date, venue, status, result)
     VALUES (@id, @group, @team1, @team2, @match_date, @venue, @status, @result)
   `);
-  try {
-    const seed = db.transaction((rows) => rows.forEach((r) => insert.run(r)));
-    seed(SEED_MATCHES);
-  } catch (e) {
-    console.warn("[db] transactional seed unavailable, inserting row-by-row:", e.message);
-    for (const r of SEED_MATCHES) insert.run(r);
-  }
-  console.log(`[db] Seeded ${SEED_MATCHES.length} matches`);
+  for (const r of SEED_MATCHES) insert.run(r);
+  const after = db.prepare("SELECT COUNT(*) AS c FROM matches").get().c;
+  console.log(`[db] Seeded matches — table now has ${after} rows`);
+} else {
+  console.log(`[db] Matches already present: ${matchCount} rows`);
 }
 
 module.exports = db;
