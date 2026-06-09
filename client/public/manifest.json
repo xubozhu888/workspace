@@ -1,0 +1,25 @@
+{
+  "name": "World Cup 2026 Family Bets",
+  "short_name": "WC Bets",
+  "description": "Family betting game for the 2026 FIFA World Cup",
+  "theme_color": "#166534",
+  "background_color": "#ffffff",
+  "display": "standalone",
+  "orientation": "portrait",
+  "start_url": "/",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
