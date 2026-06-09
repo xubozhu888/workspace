@@ -1,0 +1,1223 @@
+import React, { useState, useMemo, useEffect } from "react";
+import { createRoot } from "react-dom/client";
+import "./index.css";
+import "./pwa.js";
+
+
+    // ===============================================================
+    // API + auth helpers (talks to the Express backend, proxied at /api)
+    // ===============================================================
+    // API base resolution:
+    //  - In production (Vercel), VITE_API_BASE_URL is baked into the page and
+    //    points at the Railway backend (e.g. https://xyz.up.railway.app).
+    //  - In local dev, .env.local sets it to http://localhost:3001.
+    //  - If unset, we use the relative "/api" (Vite dev proxy).
+    // A network failure on the primary falls back to localhost:3001 for
+    // convenience when the page is opened outside the dev server.
+    const RAW_BASE = (import.meta.env.VITE_API_BASE_URL || "").trim();
+    const ENV_BASE = RAW_BASE ? RAW_BASE.replace(/\/+$/, "") : "";
+    const API_PRIMARY = ENV_BASE ? ENV_BASE + "/api" : "/api";
+    const API_FALLBACK = "http://localhost:3001/api";
+    let apiBase = API_PRIMARY;
+
+    const tokenStore = {
+      get: () => localStorage.getItem("wc_token"),
+      set: (t) => localStorage.setItem("wc_token", t),
+      clear: () => localStorage.removeItem("wc_token"),
+    };
+
+    async function callApi(base, path, { method = "GET", body } = {}) {
+      const headers = { "Content-Type": "application/json" };
+      const tok = tokenStore.get();
+      if (tok) headers.Authorization = `Bearer ${tok}`;
+      const res = await fetch(base + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+      return data;
+    }
+
+    async function apiFetch(path, opts = {}) {
+      try {
+        return await callApi(apiBase, path, opts);
+      } catch (e) {
+        // Only a network/proxy failure (TypeError) triggers the fallback;
+        // real API errors (4xx/5xx) propagate as-is.
+        if (e instanceof TypeError && apiBase !== API_FALLBACK) {
+          apiBase = API_FALLBACK; // remember it for subsequent calls
+          return await callApi(API_FALLBACK, path, opts);
+        }
+        throw e;
+      }
+    }
+    const choiceLabel = (m, c) => (c === "draw" ? "Draw" : c === "team1" ? m.team1 : m.team2);
+    function resultLabel(m) {
+      if (!m.result) return "";
+      return m.result === "draw" ? "Draw" : `${shortName(m.result === "team1" ? m.team1 : m.team2)} won`;
+    }
+    function fmtMatchDateTime(iso) {
+      // iso like 2026-06-11T15:00:00
+      const date = iso.slice(0, 10), time = iso.slice(11, 16);
+      return `${fmtDate(date)} · ${fmtTime(time)}`;
+    }
+
+    // ---------------------------------------------------------------
+    // DATA — Teams & flags (official Dec 2025 draw)
+    // ---------------------------------------------------------------
+    const TEAMS = {
+      "Mexico": "🇲🇽", "South Korea": "🇰🇷", "South Africa": "🇿🇦", "Czechia": "🇨🇿",
+      "Canada": "🇨🇦", "Switzerland": "🇨🇭", "Qatar": "🇶🇦", "Bosnia & Herzegovina": "🇧🇦",
+      "Brazil": "🇧🇷", "Morocco": "🇲🇦", "Scotland": "🏴󠁧󠁢󠁳󠁣󠁴󠁿", "Haiti": "🇭🇹",
+      "USA": "🇺🇸", "Australia": "🇦🇺", "Paraguay": "🇵🇾", "Türkiye": "🇹🇷",
+      "Germany": "🇩🇪", "Ecuador": "🇪🇨", "Ivory Coast": "🇨🇮", "Curaçao": "🇨🇼",
+      "Netherlands": "🇳🇱", "Japan": "🇯🇵", "Tunisia": "🇹🇳", "Sweden": "🇸🇪",
+      "Belgium": "🇧🇪", "Iran": "🇮🇷", "Egypt": "🇪🇬", "New Zealand": "🇳🇿",
+      "Spain": "🇪🇸", "Uruguay": "🇺🇾", "Saudi Arabia": "🇸🇦", "Cape Verde": "🇨🇻",
+      "France": "🇫🇷", "Senegal": "🇸🇳", "Norway": "🇳🇴", "Iraq": "🇮🇶",
+      "Argentina": "🇦🇷", "Austria": "🇦🇹", "Algeria": "🇩🇿", "Jordan": "🇯🇴",
+      "Portugal": "🇵🇹", "Colombia": "🇨🇴", "Uzbekistan": "🇺🇿", "DR Congo": "🇨🇩",
+      "England": "🏴󠁧󠁢󠁥󠁮󠁧󠁿", "Croatia": "🇭🇷", "Panama": "🇵🇦", "Ghana": "🇬🇭"
+    };
+    const flag = (name) => TEAMS[name] || "🏳️";
+    // Shorter display names for the compact knockout nodes.
+    const SHORT = {
+      "Bosnia & Herzegovina": "Bosnia", "South Korea": "S. Korea", "South Africa": "S. Africa",
+      "New Zealand": "N. Zealand", "Saudi Arabia": "Saudi Arabia", "Ivory Coast": "Ivory Coast"
+    };
+    const shortName = (name) => SHORT[name] || name;
+
+    const GROUPS = {
+      A: ["Mexico", "South Korea", "South Africa", "Czechia"],
+      B: ["Canada", "Switzerland", "Qatar", "Bosnia & Herzegovina"],
+      C: ["Brazil", "Morocco", "Scotland", "Haiti"],
+      D: ["USA", "Australia", "Paraguay", "Türkiye"],
+      E: ["Germany", "Ecuador", "Ivory Coast", "Curaçao"],
+      F: ["Netherlands", "Japan", "Tunisia", "Sweden"],
+      G: ["Belgium", "Iran", "Egypt", "New Zealand"],
+      H: ["Spain", "Uruguay", "Saudi Arabia", "Cape Verde"],
+      I: ["France", "Senegal", "Norway", "Iraq"],
+      J: ["Argentina", "Austria", "Algeria", "Jordan"],
+      K: ["Portugal", "Colombia", "Uzbekistan", "DR Congo"],
+      L: ["England", "Croatia", "Panama", "Ghana"]
+    };
+
+    // ---------------------------------------------------------------
+    // DATA — Group stage matches (all 72). Times in ET.
+    // Host cities & venues drawn from the 16 official 2026 venues.
+    // ---------------------------------------------------------------
+    const M = (date, time, grp, a, b, city, venue) => ({ date, time, grp, a, b, city, venue });
+    const MATCHES = [
+      // GROUP A
+      M("2026-06-11","15:00","A","Mexico","South Africa","Mexico City","Estadio Azteca"),
+      M("2026-06-11","22:00","A","South Korea","Czechia","Guadalajara","Estadio Akron"),
+      M("2026-06-18","12:00","A","Czechia","South Africa","Atlanta","Mercedes-Benz Stadium"),
+      M("2026-06-18","21:00","A","Mexico","South Korea","Guadalajara","Estadio Akron"),
+      M("2026-06-24","21:00","A","Czechia","Mexico","Mexico City","Estadio Azteca"),
+      M("2026-06-24","21:00","A","South Africa","South Korea","Monterrey","Estadio BBVA"),
+      // GROUP B
+      M("2026-06-12","15:00","B","Canada","Bosnia & Herzegovina","Toronto","BMO Field"),
+      M("2026-06-13","15:00","B","Qatar","Switzerland","SF Bay Area","Levi's Stadium"),
+      M("2026-06-18","15:00","B","Switzerland","Bosnia & Herzegovina","Los Angeles","SoFi Stadium"),
+      M("2026-06-18","18:00","B","Canada","Qatar","Vancouver","BC Place"),
+      M("2026-06-24","15:00","B","Switzerland","Canada","Vancouver","BC Place"),
+      M("2026-06-24","15:00","B","Bosnia & Herzegovina","Qatar","Seattle","Lumen Field"),
+      // GROUP C
+      M("2026-06-13","18:00","C","Brazil","Morocco","New York NJ","MetLife Stadium"),
+      M("2026-06-13","21:00","C","Haiti","Scotland","Boston","Gillette Stadium"),
+      M("2026-06-19","18:00","C","Scotland","Morocco","Boston","Gillette Stadium"),
+      M("2026-06-19","21:00","C","Brazil","Haiti","Philadelphia","Lincoln Financial Field"),
+      M("2026-06-24","18:00","C","Scotland","Brazil","Miami","Hard Rock Stadium"),
+      M("2026-06-24","18:00","C","Morocco","Haiti","Atlanta","Mercedes-Benz Stadium"),
+      // GROUP D
+      M("2026-06-12","21:00","D","USA","Paraguay","Los Angeles","SoFi Stadium"),
+      M("2026-06-13","21:00","D","Australia","Türkiye","Vancouver","BC Place"),
+      M("2026-06-19","15:00","D","USA","Australia","Seattle","Lumen Field"),
+      M("2026-06-19","21:00","D","Türkiye","Paraguay","SF Bay Area","Levi's Stadium"),
+      M("2026-06-25","22:00","D","Türkiye","USA","Los Angeles","SoFi Stadium"),
+      M("2026-06-25","22:00","D","Paraguay","Australia","SF Bay Area","Levi's Stadium"),
+      // GROUP E
+      M("2026-06-14","13:00","E","Germany","Curaçao","Houston","NRG Stadium"),
+      M("2026-06-14","19:00","E","Ivory Coast","Ecuador","Philadelphia","Lincoln Financial Field"),
+      M("2026-06-20","16:00","E","Germany","Ivory Coast","Toronto","BMO Field"),
+      M("2026-06-20","20:00","E","Ecuador","Curaçao","Kansas City","Arrowhead Stadium"),
+      M("2026-06-25","16:00","E","Ecuador","Germany","New York NJ","MetLife Stadium"),
+      M("2026-06-25","16:00","E","Curaçao","Ivory Coast","Philadelphia","Lincoln Financial Field"),
+      // GROUP F
+      M("2026-06-14","16:00","F","Netherlands","Japan","Dallas","AT&T Stadium"),
+      M("2026-06-14","22:00","F","Sweden","Tunisia","Monterrey","Estadio BBVA"),
+      M("2026-06-20","13:00","F","Netherlands","Sweden","Houston","NRG Stadium"),
+      M("2026-06-20","21:00","F","Tunisia","Japan","Monterrey","Estadio BBVA"),
+      M("2026-06-25","19:00","F","Japan","Sweden","Dallas","AT&T Stadium"),
+      M("2026-06-25","19:00","F","Tunisia","Netherlands","Kansas City","Arrowhead Stadium"),
+      // GROUP G
+      M("2026-06-15","15:00","G","Belgium","Egypt","Seattle","Lumen Field"),
+      M("2026-06-15","21:00","G","Iran","New Zealand","Los Angeles","SoFi Stadium"),
+      M("2026-06-21","15:00","G","Belgium","Iran","Los Angeles","SoFi Stadium"),
+      M("2026-06-21","21:00","G","New Zealand","Egypt","Vancouver","BC Place"),
+      M("2026-06-26","23:00","G","Egypt","Iran","Seattle","Lumen Field"),
+      M("2026-06-26","23:00","G","New Zealand","Belgium","Vancouver","BC Place"),
+      // GROUP H
+      M("2026-06-15","12:00","H","Spain","Cape Verde","Atlanta","Mercedes-Benz Stadium"),
+      M("2026-06-15","18:00","H","Saudi Arabia","Uruguay","Miami","Hard Rock Stadium"),
+      M("2026-06-21","12:00","H","Spain","Saudi Arabia","Atlanta","Mercedes-Benz Stadium"),
+      M("2026-06-21","18:00","H","Uruguay","Cape Verde","Miami","Hard Rock Stadium"),
+      M("2026-06-26","20:00","H","Cape Verde","Saudi Arabia","Houston","NRG Stadium"),
+      M("2026-06-26","20:00","H","Uruguay","Spain","Guadalajara","Estadio Akron"),
+      // GROUP I
+      M("2026-06-16","15:00","I","France","Senegal","New York NJ","MetLife Stadium"),
+      M("2026-06-16","18:00","I","Iraq","Norway","Boston","Gillette Stadium"),
+      M("2026-06-22","17:00","I","France","Iraq","Philadelphia","Lincoln Financial Field"),
+      M("2026-06-22","20:00","I","Norway","Senegal","New York NJ","MetLife Stadium"),
+      M("2026-06-26","15:00","I","Norway","France","Boston","Gillette Stadium"),
+      M("2026-06-26","15:00","I","Senegal","Iraq","Toronto","BMO Field"),
+      // GROUP J
+      M("2026-06-16","21:00","J","Argentina","Algeria","Kansas City","Arrowhead Stadium"),
+      M("2026-06-16","21:00","J","Austria","Jordan","SF Bay Area","Levi's Stadium"),
+      M("2026-06-22","13:00","J","Argentina","Austria","Dallas","AT&T Stadium"),
+      M("2026-06-22","23:00","J","Jordan","Algeria","SF Bay Area","Levi's Stadium"),
+      M("2026-06-27","22:00","J","Algeria","Austria","Kansas City","Arrowhead Stadium"),
+      M("2026-06-27","22:00","J","Jordan","Argentina","Dallas","AT&T Stadium"),
+      // GROUP K
+      M("2026-06-17","13:00","K","Portugal","DR Congo","Houston","NRG Stadium"),
+      M("2026-06-17","22:00","K","Uzbekistan","Colombia","Mexico City","Estadio Azteca"),
+      M("2026-06-23","13:00","K","Portugal","Uzbekistan","Houston","NRG Stadium"),
+      M("2026-06-23","22:00","K","Colombia","DR Congo","Guadalajara","Estadio Akron"),
+      M("2026-06-27","19:30","K","Colombia","Portugal","Miami","Hard Rock Stadium"),
+      M("2026-06-27","19:30","K","DR Congo","Uzbekistan","Atlanta","Mercedes-Benz Stadium"),
+      // GROUP L
+      M("2026-06-17","16:00","L","England","Croatia","Dallas","AT&T Stadium"),
+      M("2026-06-17","19:00","L","Ghana","Panama","Toronto","BMO Field"),
+      M("2026-06-23","16:00","L","England","Ghana","Boston","Gillette Stadium"),
+      M("2026-06-23","19:00","L","Panama","Croatia","Toronto","BMO Field"),
+      M("2026-06-27","17:00","L","Panama","England","New York NJ","MetLife Stadium"),
+      M("2026-06-27","17:00","L","Croatia","Ghana","Philadelphia","Lincoln Financial Field")
+    ];
+
+    // ---------------------------------------------------------------
+    // DATA — Knockout bracket (official Round of 32 pairings 73–88)
+    // ---------------------------------------------------------------
+    const R32 = [
+      { n: 73, a: "2nd Group A", b: "2nd Group B" },
+      { n: 74, a: "1st Group E", b: "Best 3rd A/B/C/D/F" },
+      { n: 75, a: "1st Group F", b: "2nd Group C" },
+      { n: 76, a: "1st Group C", b: "2nd Group F" },
+      { n: 77, a: "1st Group I", b: "Best 3rd C/D/F/G/H" },
+      { n: 78, a: "2nd Group E", b: "2nd Group I" },
+      { n: 79, a: "1st Group A", b: "Best 3rd C/E/F/H/I" },
+      { n: 80, a: "1st Group L", b: "Best 3rd E/H/I/J/K" },
+      { n: 81, a: "1st Group D", b: "Best 3rd B/E/F/I/J" },
+      { n: 82, a: "1st Group G", b: "Best 3rd A/E/H/I/J" },
+      { n: 83, a: "2nd Group K", b: "2nd Group L" },
+      { n: 84, a: "1st Group H", b: "2nd Group J" },
+      { n: 85, a: "1st Group B", b: "Best 3rd E/F/G/I/J" },
+      { n: 86, a: "1st Group J", b: "2nd Group H" },
+      { n: 87, a: "1st Group K", b: "Best 3rd D/E/I/J/L" },
+      { n: 88, a: "2nd Group D", b: "2nd Group G" }
+    ];
+    // Later rounds use placeholder slots feeding from the previous round.
+    const buildRound = (startN, count, feeders) =>
+      Array.from({ length: count }, (_, i) => ({
+        n: startN + i,
+        a: `Winner Match ${feeders[i * 2]}`,
+        b: `Winner Match ${feeders[i * 2 + 1]}`
+      }));
+    // Official 2026 feeder structure (crossed, not sequential).
+    const R16 = buildRound(89, 8, [74, 77, 73, 75, 76, 78, 79, 80, 83, 84, 81, 82, 86, 88, 85, 87]);
+    const QF  = buildRound(97, 4, [89, 90, 93, 94, 91, 92, 95, 96]);
+    const SF  = buildRound(101, 2, [97, 98, 99, 100]);
+    const FINAL = [{ n: 104, a: "Winner Match 101", b: "Winner Match 102" }];
+
+    // Date / time (ET) / venue per knockout match number — official 2026 schedule.
+    const KO = (date, time, city, venue) => ({ date, time, city, venue });
+    const KO_META = {
+      73: KO("2026-06-28","15:00","Los Angeles","SoFi Stadium"),
+      74: KO("2026-06-29","16:30","Boston","Gillette Stadium"),
+      75: KO("2026-06-29","21:00","Monterrey","Estadio BBVA"),
+      76: KO("2026-06-29","13:00","Houston","NRG Stadium"),
+      77: KO("2026-06-30","17:00","New York NJ","MetLife Stadium"),
+      78: KO("2026-06-30","13:00","Dallas","AT&T Stadium"),
+      79: KO("2026-06-30","21:00","Mexico City","Estadio Azteca"),
+      80: KO("2026-07-01","12:00","Atlanta","Mercedes-Benz Stadium"),
+      81: KO("2026-07-01","20:00","SF Bay Area","Levi's Stadium"),
+      82: KO("2026-07-01","16:00","Seattle","Lumen Field"),
+      83: KO("2026-07-02","19:00","Toronto","BMO Field"),
+      84: KO("2026-07-02","15:00","Los Angeles","SoFi Stadium"),
+      85: KO("2026-07-02","23:00","Vancouver","BC Place"),
+      86: KO("2026-07-03","18:00","Miami","Hard Rock Stadium"),
+      87: KO("2026-07-03","21:30","Kansas City","Arrowhead Stadium"),
+      88: KO("2026-07-03","14:00","Dallas","AT&T Stadium"),
+      89: KO("2026-07-04","17:00","Philadelphia","Lincoln Financial Field"),
+      90: KO("2026-07-04","13:00","Houston","NRG Stadium"),
+      91: KO("2026-07-05","16:00","New York NJ","MetLife Stadium"),
+      92: KO("2026-07-05","20:00","Mexico City","Estadio Azteca"),
+      93: KO("2026-07-06","15:00","Dallas","AT&T Stadium"),
+      94: KO("2026-07-06","20:00","Seattle","Lumen Field"),
+      95: KO("2026-07-07","12:00","Atlanta","Mercedes-Benz Stadium"),
+      96: KO("2026-07-07","16:00","Vancouver","BC Place"),
+      97: KO("2026-07-09","16:00","Boston","Gillette Stadium"),
+      98: KO("2026-07-10","15:00","Los Angeles","SoFi Stadium"),
+      99: KO("2026-07-11","17:00","Miami","Hard Rock Stadium"),
+      100: KO("2026-07-11","21:00","Kansas City","Arrowhead Stadium"),
+      101: KO("2026-07-14","15:00","Dallas","AT&T Stadium"),
+      102: KO("2026-07-15","15:00","Atlanta","Mercedes-Benz Stadium"),
+      104: KO("2026-07-19","15:00","New York NJ","MetLife Stadium")
+    };
+
+    const ALL_KO = [].concat(R32, R16, QF, SF, FINAL);
+    const MATCH_BY_N = (() => {
+      const map = {};
+      ALL_KO.forEach(m => { map[m.n] = m; });
+      return map;
+    })();
+
+    // ---- Compact mirrored-bracket geometry -------------------------------
+    // Nodes are absolutely positioned. The later rounds (QF, SF) are tucked
+    // into the vertical gaps of the previous round to save horizontal space:
+    //   R32 | R16  QF  SF | 🏆 Final | SF  QF  R16 | R32
+    const NODE_W = 134, NODE_H = 58, PV = 65, HEAD_H = 14;
+    const T0 = HEAD_H + NODE_H / 2 + 6;
+    const cyR32 = i => T0 + i * PV;                 // 8 leaves
+    const cyR16 = k => T0 + (2 * k + 0.5) * PV;     // midpoint of its R32 pair
+    const cyQF = j => T0 + (4 * j + 1.5) * PV;      // midpoint of its R16 pair
+    const cySF = () => T0 + 3.5 * PV;               // centre
+    const X = { R32: 0, R16: 150, QF: 226, SF: 300, FINAL: 450 };
+    const CENTER_X = X.FINAL + NODE_W / 2;
+    const mirror = x => 2 * CENTER_X - (x + NODE_W);
+
+    // The Final is a bigger node lifted up into the open centre space; the two
+    // semi-finals are squeezed close together below it with a small gap between.
+    const FINAL_W = 158, FINAL_H = 76;
+    const SF_GAP = 50;
+    const SF_L_X = CENTER_X - SF_GAP / 2 - NODE_W;
+    const SF_R_X = CENTER_X + SF_GAP / 2;
+    const FINAL_X = CENTER_X - FINAL_W / 2;
+    const FINAL_CY = T0 + 2.25 * PV;
+    const dimW = n => n === 104 ? FINAL_W : NODE_W;
+    const dimH = n => n === 104 ? FINAL_H : NODE_H;
+
+    // Order follows the actual bracket tree so feeders sit beside their match.
+    // Left half = SF 101's subtree, right half = SF 102's subtree.
+    const POS = {};
+    [74, 77, 73, 75, 83, 84, 81, 82].forEach((n, i) => POS[n] = { x: X.R32, cy: cyR32(i) });
+    [89, 90, 93, 94].forEach((n, k) => POS[n] = { x: X.R16, cy: cyR16(k) });
+    [97, 98].forEach((n, j) => POS[n] = { x: X.QF, cy: cyQF(j) });
+    POS[101] = { x: SF_L_X, cy: cySF() };
+    POS[104] = { x: FINAL_X, cy: FINAL_CY };
+    [76, 78, 79, 80, 86, 88, 85, 87].forEach((n, i) => POS[n] = { x: mirror(X.R32), cy: cyR32(i) });
+    [91, 92, 95, 96].forEach((n, k) => POS[n] = { x: mirror(X.R16), cy: cyR16(k) });
+    [99, 100].forEach((n, j) => POS[n] = { x: mirror(X.QF), cy: cyQF(j) });
+    POS[102] = { x: SF_R_X, cy: cySF() };
+
+    const BRACKET_W = mirror(X.R32) + NODE_W;
+    const BRACKET_H = T0 + 7 * PV + NODE_H / 2 + 8;
+
+    const KO_HEADERS = [
+      { l: "Round of 32", x: X.R32 }, { l: "Round of 16", x: X.R16 }, { l: "QF", x: X.QF }, { l: "SF", x: SF_L_X },
+      { l: "🏆 Final", x: FINAL_X }, { l: "SF", x: SF_R_X },
+      { l: "QF", x: mirror(X.QF) }, { l: "Round of 16", x: mirror(X.R16) }, { l: "Round of 32", x: mirror(X.R32) }
+    ];
+
+    // Orthogonal connector from feeder → target, aware of each node's size.
+    // Overlapping rounds (R16→QF, QF→SF, SF→Final) use a short stub into the
+    // target's near (top/bottom) edge; non-overlapping ones a centred elbow.
+    function connectorPath(fN, tN) {
+      const f = POS[fN], t = POS[tN];
+      if (!f || !t) return null;
+      const fw = dimW(fN), tw = dimW(tN), th = dimH(tN);
+      const fcx = f.x + fw / 2, tcx = t.x + tw / 2;
+      const dir = tcx > fcx ? 1 : -1;
+      const fEdge = dir > 0 ? f.x + fw : f.x;
+      const overlap = f.x < t.x + tw && t.x < f.x + fw;
+      if (overlap) {
+        const edgeY = f.cy < t.cy ? t.cy - th / 2 : t.cy + th / 2;
+        return `M ${fEdge} ${f.cy} H ${tcx} V ${edgeY}`;
+      }
+      const tEdge = dir > 0 ? t.x : t.x + tw;
+      const mx = (fEdge + tEdge) / 2;
+      return `M ${fEdge} ${f.cy} H ${mx} V ${t.cy} H ${tEdge}`;
+    }
+
+    // Which Round-of-32 match each group's 1st / 2nd place feeds into.
+    const GROUP_DEST = (() => {
+      const d = {};
+      R32.forEach(m => [m.a, m.b].forEach(slot => {
+        const mm = /^(1st|2nd) Group ([A-L])$/.exec(slot);
+        if (mm) (d[mm[2]] = d[mm[2]] || {})[mm[1] === "1st" ? "first" : "second"] = m.n;
+      }));
+      return d;
+    })();
+    // Group selector columns flank the bracket, ordered so each group sits near
+    // where its 1st place feeds the Round of 32 (left half vs right half).
+    const LEFT_GROUPS = ["E", "I", "F", "H", "D", "G"];   // 1st → M74,77,75,84,81,82 (left half)
+    const RIGHT_GROUPS = ["C", "A", "L", "J", "B", "K"];  // 1st → M76,79,80,86,85,87 (right half)
+    const GROUP_W = 144;
+
+    // ---------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------
+    const DAY = { 0:"Sun",1:"Mon",2:"Tue",3:"Wed",4:"Thu",5:"Fri",6:"Sat" };
+    const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    function fmtDate(iso) {
+      const d = new Date(iso + "T12:00:00");
+      return `${DAY[d.getUTCDay()]}, ${MON[d.getUTCMonth()]} ${d.getUTCDate()}`;
+    }
+    function fmtTime(t) {
+      let [h, m] = t.split(":").map(Number);
+      const ap = h >= 12 ? "PM" : "AM";
+      h = h % 12 || 12;
+      return `${h}:${String(m).padStart(2,"0")} ${ap} ET`;
+    }
+    const ALL_DATES = [...new Set(MATCHES.map(m => m.date))].sort();
+    const GROUP_LETTERS = Object.keys(GROUPS);
+
+    // ---------------------------------------------------------------
+    // Small UI pieces
+    // ---------------------------------------------------------------
+    function Team({ name, align }) {
+      return (
+        <div className={`flex items-center gap-2 ${align === "right" ? "flex-row-reverse text-right" : ""}`}>
+          <span className="flag text-2xl leading-none">{flag(name)}</span>
+          <span className="font-semibold text-sm sm:text-base">{name}</span>
+        </div>
+      );
+    }
+
+    function GroupBadge({ g }) {
+      return (
+        <span className="inline-flex items-center justify-center w-7 h-7 rounded-md bg-pitch-700 text-white text-xs font-bold shrink-0">
+          {g}
+        </span>
+      );
+    }
+
+    function Pill({ active, onClick, children }) {
+      return (
+        <button
+          onClick={onClick}
+          className={`px-3 py-1.5 rounded-full text-sm font-medium transition whitespace-nowrap
+            ${active ? "bg-pitch-700 text-white shadow" : "bg-white text-pitch-800 border border-pitch-200 hover:bg-pitch-100"}`}>
+          {children}
+        </button>
+      );
+    }
+
+    // ---------------------------------------------------------------
+    // TAB 1 — Schedule
+    // ---------------------------------------------------------------
+    function Schedule({ onOpenMatch, apiIndex }) {
+      const [grp, setGrp] = useState("All");
+      const [date, setDate] = useState("All");
+
+      const filtered = useMemo(() =>
+        MATCHES
+          .filter(m => grp === "All" || m.grp === grp)
+          .filter(m => date === "All" || m.date === date)
+          .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)),
+        [grp, date]);
+
+      const byDate = useMemo(() => {
+        const out = {};
+        filtered.forEach(m => { (out[m.date] = out[m.date] || []).push(m); });
+        return out;
+      }, [filtered]);
+
+      return (
+        <div>
+          {/* Filters */}
+          <div className="space-y-3 mb-6">
+            <div>
+              <div className="text-xs uppercase tracking-wide text-pitch-600 font-semibold mb-2">Group</div>
+              <div className="flex flex-wrap gap-2">
+                <Pill active={grp === "All"} onClick={() => setGrp("All")}>All</Pill>
+                {GROUP_LETTERS.map(g =>
+                  <Pill key={g} active={grp === g} onClick={() => setGrp(g)}>Group {g}</Pill>)}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-wide text-pitch-600 font-semibold mb-2">Date</div>
+              <div className="flex flex-wrap gap-2">
+                <Pill active={date === "All"} onClick={() => setDate("All")}>All</Pill>
+                {ALL_DATES.map(d =>
+                  <Pill key={d} active={date === d} onClick={() => setDate(d)}>{fmtDate(d)}</Pill>)}
+              </div>
+            </div>
+          </div>
+
+          <div className="text-sm text-pitch-600 mb-4">{filtered.length} match{filtered.length !== 1 ? "es" : ""}</div>
+
+          {/* Matches grouped by date */}
+          {Object.keys(byDate).length === 0 &&
+            <div className="text-center text-pitch-500 py-12">No matches for this filter.</div>}
+
+          {Object.entries(byDate).map(([d, ms]) => (
+            <div key={d} className="mb-8">
+              <h3 className="text-lg font-bold text-pitch-800 mb-3 sticky top-0 bg-pitch-50/90 backdrop-blur py-1">
+                {fmtDate(d)} <span className="text-pitch-400 font-normal text-sm">· 2026</span>
+              </h3>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {ms.map((m, i) => {
+                  const api = apiIndex[`${m.a}|${m.b}|${m.date}|${m.time}`];
+                  // Always open the modal; if the backend record isn't loaded
+                  // (server offline / still loading) pass a synthetic match so
+                  // the window still opens and explains what's wrong.
+                  const open = api || {
+                    id: null, group: m.grp, team1: m.a, team2: m.b,
+                    match_date: `${m.date}T${m.time}:00`,
+                    venue: `${m.venue}, ${m.city}`, status: "upcoming", result: null,
+                  };
+                  const finished = api && api.status === "finished";
+                  return (
+                  <div key={i} onClick={() => onOpenMatch(open)}
+                    className="bg-white rounded-xl border border-pitch-100 shadow-sm p-4 hover:shadow-md hover:border-pitch-300 transition cursor-pointer">
+                    <div className="flex items-center justify-between mb-3">
+                      <div className="flex items-center gap-2">
+                        <GroupBadge g={m.grp} />
+                        <span className="text-xs text-pitch-500">Group {m.grp}</span>
+                      </div>
+                      <span className="text-xs font-semibold text-pitch-700 bg-pitch-100 px-2 py-1 rounded-md">{fmtTime(m.time)}</span>
+                    </div>
+                    <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+                      <Team name={m.a} />
+                      <span className="text-pitch-300 font-bold text-sm px-1">vs</span>
+                      <Team name={m.b} align="right" />
+                    </div>
+                    <div className="mt-3 pt-3 border-t border-pitch-50 flex items-center justify-between gap-2">
+                      <div className="text-xs text-pitch-500 flex items-center gap-1 min-w-0">
+                        <span>📍</span><span className="font-medium text-pitch-700 truncate">{m.venue}</span>
+                        <span>·</span><span className="truncate">{m.city}</span>
+                      </div>
+                      <span className={`text-[11px] font-bold whitespace-nowrap shrink-0 ${finished ? "text-pitch-700" : "text-pitch-500"}`}>
+                        {finished ? `🏁 ${resultLabel(api)}` : "Place bet ›"}
+                      </span>
+                    </div>
+                  </div>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------
+    // TAB 2 — Groups (static reference of the official draw)
+    // ---------------------------------------------------------------
+    function Groups() {
+      return (
+        <div>
+          <p className="text-sm text-pitch-600 mb-5">
+            The 12 groups from the official December 2025 draw. Top 2 of each group, plus the 8 best
+            third-placed teams, advance to the Round of 32. Head to the <strong>Knockout</strong> tab to pick
+            each group's 1st &amp; 2nd place and build your bracket.
+          </p>
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+            {GROUP_LETTERS.map(g => (
+              <div key={g} className="bg-white rounded-xl border border-pitch-100 shadow-sm overflow-hidden">
+                <div className="bg-pitch-700 text-white px-4 py-3 flex items-center gap-2">
+                  <GroupBadge g={g} />
+                  <span className="font-bold">Group {g}</span>
+                </div>
+                <ul className="divide-y divide-pitch-50">
+                  {GROUPS[g].map(team => (
+                    <li key={team} className="flex items-center gap-3 px-4 py-3">
+                      <span className="flag text-2xl leading-none">{flag(team)}</span>
+                      <span className="font-medium text-sm">{team}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------
+    // TAB 3 — Knockout bracket
+    // ---------------------------------------------------------------
+    function SlotSide({ slot, selected, onPick }) {
+      const inner = slot.filled ? (
+        <React.Fragment>
+          <span className="flag text-sm leading-none shrink-0">{slot.flag}</span>
+          <span className={`text-[10px] font-semibold leading-none truncate ${selected ? "text-pitch-800" : "text-pitch-900"}`}>{shortName(slot.name)}</span>
+        </React.Fragment>
+      ) : (
+        <span className={`text-[9px] leading-none truncate ${selected ? "text-pitch-700 font-medium" : "text-pitch-500"}`}>{slot.label}</span>
+      );
+      const base = "w-full min-w-0 flex items-center gap-1 px-1.5 py-0.5 rounded";
+      const title = slot.filled ? `${slot.name} (${slot.origin})` : slot.label;
+      if (onPick) {
+        return (
+          <button onClick={onPick} title={title}
+            className={`${base} ${selected ? "bg-pitch-100 ring-1 ring-pitch-400" : "hover:bg-pitch-50"}`}>
+            {inner}
+            {selected && <span className="ml-auto text-[9px] shrink-0">🏆</span>}
+          </button>
+        );
+      }
+      return <div className={base} title={title}>{inner}</div>;
+    }
+
+    function MatchNode({ n, a, b, meta, pickedSide, onPick, w = NODE_W, h = NODE_H, accent }) {
+      const decided = pickedSide === "a" || pickedSide === "b";
+      return (
+        <div style={{ width: w, height: h }}
+          className={`relative z-10 rounded-md border shadow-sm overflow-hidden flex flex-col
+            ${accent ? "bg-pitch-50 border-pitch-300 ring-1 ring-pitch-200" : "bg-white"}
+            ${decided ? "border-pitch-400" : accent ? "border-pitch-300" : "border-pitch-100"}`}>
+          <div className="flex items-center justify-between px-1.5 pt-0.5 text-[8px] text-pitch-400 leading-none">
+            <span className="font-bold text-pitch-700">{accent ? "🏆 " : ""}M{n}</span>
+            {meta && <span title={`${fmtDate(meta.date)} · ${fmtTime(meta.time)} · ${meta.venue}, ${meta.city}`}>
+              {fmtDate(meta.date).split(", ")[1]} · {fmtTime(meta.time).replace(" ET", "")}
+            </span>}
+          </div>
+          <div className="flex-1 flex flex-col justify-center px-0.5 gap-0.5">
+            <SlotSide slot={a} selected={pickedSide === "a"} onPick={onPick ? () => onPick("a") : undefined} />
+            <SlotSide slot={b} selected={pickedSide === "b"} onPick={onPick ? () => onPick("b") : undefined} />
+          </div>
+          {meta && (
+            <div className="px-1.5 pb-0.5 text-[8px] text-pitch-400 leading-none truncate" title={`${meta.venue}, ${meta.city}`}>
+              📍 {meta.city}
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    // Connector edges parsed straight from each match's "Winner Match N" slots,
+    // so they always reflect the real feeder structure.
+    const CONNECTIONS = (() => {
+      const out = [];
+      ALL_KO.forEach(m => [m.a, m.b].forEach(slot => {
+        const w = /^Winner Match (\d+)$/.exec(slot);
+        if (w) out.push([+w[1], m.n]);
+      }));
+      return out;
+    })();
+
+    // A group card in the Knockout tab: pick which team finishes 1st / 2nd.
+    function GroupPicker({ g, picks, dest, onPick }) {
+      return (
+        <div className="bg-white rounded-lg border border-pitch-100 shadow-sm overflow-hidden">
+          <div className="bg-pitch-700 text-white px-2 py-1 flex items-center justify-between gap-1">
+            <span className="font-bold text-[11px]">Group {g}</span>
+            <span className="text-[8px] text-pitch-200 whitespace-nowrap">1→M{dest.first} · 2→M{dest.second}</span>
+          </div>
+          <ul>
+            {GROUPS[g].map(team => {
+              const isFirst = picks.first === team, isSecond = picks.second === team;
+              return (
+                <li key={team} className="flex items-center gap-1 px-1.5 py-[2px]">
+                  <span className="flag text-[13px] leading-none shrink-0">{flag(team)}</span>
+                  <span className={`text-[10px] truncate flex-1 ${isFirst || isSecond ? "font-semibold text-pitch-900" : "text-pitch-700"}`}>{shortName(team)}</span>
+                  <button onClick={() => onPick(g, "first", team)} title="Finishes 1st"
+                    className={`w-[15px] h-[15px] rounded text-[9px] font-bold leading-none shrink-0 ${isFirst ? "bg-pitch-600 text-white" : "bg-pitch-100 text-pitch-500 hover:bg-pitch-200"}`}>1</button>
+                  <button onClick={() => onPick(g, "second", team)} title="Finishes 2nd"
+                    className={`w-[15px] h-[15px] rounded text-[9px] font-bold leading-none shrink-0 ${isSecond ? "bg-pitch-400 text-white" : "bg-pitch-100 text-pitch-500 hover:bg-pitch-200"}`}>2</button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      );
+    }
+
+    function GroupColumn({ groups, groupPicks, setGroupPick }) {
+      return (
+        <div className="flex flex-col shrink-0" style={{ width: GROUP_W }}>
+          <div className="text-[10px] font-bold text-pitch-700 mb-1 text-center">Groups → R32</div>
+          <div className="flex-1 flex flex-col justify-around">
+            {groups.map(g => (
+              <GroupPicker key={g} g={g} picks={groupPicks[g]} dest={GROUP_DEST[g]} onPick={setGroupPick} />
+            ))}
+          </div>
+        </div>
+      );
+    }
+
+    function Bracket({ groupPicks, setGroupPick, clearGroupPicks, picks, pickWinner, clearPicks }) {
+      // Resolve a slot to a competitor, recursing through "Winner Match N" by
+      // following the user's picks. `competitor` = a real entrant that can be
+      // advanced (a named team OR a "best 3rd" placeholder, which keeps its
+      // "or" text). Unpicked group slots and undecided winners are not competitors.
+      function resolve(slot) {
+        const grp = /^(1st|2nd) Group ([A-L])$/.exec(slot);
+        if (grp) {
+          const team = groupPicks[grp[2]][grp[1] === "1st" ? "first" : "second"];
+          if (team) return { competitor: true, filled: true, name: team, flag: flag(team), origin: `${grp[1]} · Group ${grp[2]}` };
+          return { competitor: false, filled: false, label: slot };
+        }
+        const win = /^Winner Match (\d+)$/.exec(slot);
+        if (win) {
+          const n = +win[1];
+          const side = picks[n];
+          if (side) {
+            const src = MATCH_BY_N[n];
+            const r = resolve(side === "a" ? src.a : src.b);
+            if (r.competitor) return { ...r, origin: `Winner · M${n}` };
+          }
+          return { competitor: false, filled: false, label: `Winner ${n}` };
+        }
+        // "Best 3rd …/…" — a valid entrant that keeps its "or" format
+        return { competitor: true, filled: false, label: slot };
+      }
+
+      const anyGroup = Object.values(groupPicks).some(p => p.first || p.second);
+      const anyWinner = Object.values(picks).some(Boolean);
+
+      return (
+        <div>
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mb-2">
+            <span className="text-xs text-pitch-600">
+              <strong>Pick each group's 1st &amp; 2nd</strong> with the 1 / 2 buttons (left &amp; right columns) to fill the Round of 32,
+              then <strong>click a team in any match</strong> to advance a winner toward the centre Final.
+            </span>
+            {anyGroup && (
+              <button onClick={clearGroupPicks}
+                className="text-xs font-medium text-pitch-600 hover:text-pitch-900 underline underline-offset-2">Clear groups</button>
+            )}
+            {anyWinner && (
+              <button onClick={clearPicks}
+                className="text-xs font-medium text-pitch-600 hover:text-pitch-900 underline underline-offset-2">Clear winners</button>
+            )}
+          </div>
+          <div className="overflow-x-auto pb-2">
+            <div className="flex gap-3 items-stretch" style={{ minWidth: BRACKET_W + 2 * (GROUP_W + 12) }}>
+              <GroupColumn groups={LEFT_GROUPS} groupPicks={groupPicks} setGroupPick={setGroupPick} />
+              <div className="relative shrink-0" style={{ width: BRACKET_W, height: BRACKET_H }}>
+                <svg className="absolute inset-0 pointer-events-none" width={BRACKET_W} height={BRACKET_H} style={{ zIndex: 0 }}>
+                  {CONNECTIONS.map(([f, t], i) => {
+                    const d = connectorPath(f, t);
+                    return d && <path key={i} d={d} fill="none" stroke="#8ec3a1" strokeWidth="2" />;
+                  })}
+                </svg>
+                {KO_HEADERS.map((h, i) => (
+                  <div key={i} className="absolute font-bold text-[10px] text-pitch-700 whitespace-nowrap"
+                    style={{ left: h.x, top: 0, width: NODE_W }}>{h.l}</div>
+                ))}
+                {ALL_KO.map(m => {
+                  const p = POS[m.n];
+                  const a = resolve(m.a), b = resolve(m.b);
+                  const pickable = a.competitor && b.competitor;
+                  const w = dimW(m.n), h = dimH(m.n);
+                  return (
+                    <div key={m.n} className="absolute" style={{ left: p.x, top: p.cy - h / 2 }}>
+                      <MatchNode n={m.n} a={a} b={b} meta={KO_META[m.n]} w={w} h={h} accent={m.n === 104}
+                        pickedSide={picks[m.n]}
+                        onPick={pickable ? (side => pickWinner(m.n, side)) : undefined} />
+                    </div>
+                  );
+                })}
+              </div>
+              <GroupColumn groups={RIGHT_GROUPS} groupPicks={groupPicks} setGroupPick={setGroupPick} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ===============================================================
+    // Auth screen (shown before the app when not logged in)
+    // ===============================================================
+    function AuthScreen({ onAuthed }) {
+      const [mode, setMode] = useState("login");
+      const [username, setUsername] = useState("");
+      const [password, setPassword] = useState("");
+      const [displayName, setDisplayName] = useState("");
+      const [err, setErr] = useState("");
+      const [busy, setBusy] = useState(false);
+
+      const submit = async (e) => {
+        e.preventDefault();
+        setErr(""); setBusy(true);
+        try {
+          const path = mode === "login" ? "/auth/login" : "/auth/register";
+          const body = mode === "login"
+            ? { username, password }
+            : { username, password, display_name: displayName || username };
+          const data = await apiFetch(path, { method: "POST", body });
+          tokenStore.set(data.token);
+          onAuthed(data.user);
+        } catch (e) { setErr(e.message); } finally { setBusy(false); }
+      };
+
+      const field = "w-full px-3 py-2 rounded-lg border border-pitch-200 focus:outline-none focus:ring-2 focus:ring-pitch-400 text-sm";
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-pitch-900 px-4">
+          <div className="w-full max-w-sm">
+            <div className="text-center text-white mb-6">
+              <div className="text-4xl mb-1">⚽</div>
+              <h1 className="text-2xl font-extrabold">World Cup 2026 — Family Bets</h1>
+              <p className="text-pitch-300 text-sm">Sign in to wager points with the family.</p>
+            </div>
+            <form onSubmit={submit} className="bg-white rounded-2xl shadow-lg p-5 space-y-3">
+              <div className="flex rounded-lg bg-pitch-100 p-1 text-sm font-semibold">
+                {["login", "register"].map(m => (
+                  <button key={m} type="button" onClick={() => { setMode(m); setErr(""); }}
+                    className={`flex-1 py-1.5 rounded-md transition ${mode === m ? "bg-pitch-700 text-white" : "text-pitch-700"}`}>
+                    {m === "login" ? "Log in" : "Register"}
+                  </button>
+                ))}
+              </div>
+              {mode === "register" && (
+                <input className={field} placeholder="Display name (shown on leaderboard)"
+                  value={displayName} onChange={e => setDisplayName(e.target.value)} />
+              )}
+              <input className={field} placeholder="Username" autoCapitalize="none"
+                value={username} onChange={e => setUsername(e.target.value)} required />
+              <input className={field} type="password" placeholder="Password"
+                value={password} onChange={e => setPassword(e.target.value)} required />
+              {err && <div className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{err}</div>}
+              <button type="submit" disabled={busy}
+                className="w-full bg-pitch-700 hover:bg-pitch-800 disabled:opacity-50 text-white font-semibold py-2.5 rounded-lg transition">
+                {busy ? "Please wait…" : mode === "login" ? "Log in" : "Create account (+100 pts)"}
+              </button>
+              {mode === "register" && <p className="text-xs text-pitch-400 text-center">New accounts start with 100 points.</p>}
+            </form>
+          </div>
+        </div>
+      );
+    }
+
+    // ===============================================================
+    // Match detail + betting modal
+    // ===============================================================
+    function MarketBar({ market, match }) {
+      if (!market || market.total_bettors < 2) {
+        return <p className="text-xs text-pitch-400">Market opens once at least 2 family members have bet.</p>;
+      }
+      const rows = [
+        { key: "team1", label: match.team1, color: "bg-pitch-600" },
+        { key: "draw", label: "Draw", color: "bg-pitch-400" },
+        { key: "team2", label: match.team2, color: "bg-pitch-700" },
+      ];
+      const pool = market.total_pool || 1;
+      return (
+        <div className="space-y-2">
+          {rows.map(r => {
+            const v = market.totals[r.key] || 0;
+            const pct = Math.round((v / pool) * 100);
+            return (
+              <div key={r.key}>
+                <div className="flex justify-between text-xs mb-1">
+                  <span className="font-medium text-pitch-800 truncate">{r.label}</span>
+                  <span className="text-pitch-500 shrink-0 ml-2">{pct}% · {v} pts</span>
+                </div>
+                <div className="h-2.5 rounded-full bg-pitch-100 overflow-hidden">
+                  <div className={`h-full ${r.color}`} style={{ width: `${pct}%` }}></div>
+                </div>
+              </div>
+            );
+          })}
+          <div className="text-xs text-pitch-500 pt-1">
+            Pool: <strong className="text-pitch-800">{market.total_pool} pts</strong> · {market.total_bettors} bettors
+          </div>
+        </div>
+      );
+    }
+
+    function MatchModal({ match, user, onClose, onBalance }) {
+      const [market, setMarket] = useState(null);
+      const [myBet, setMyBet] = useState(undefined); // undefined=loading | null=none | object
+      const [choice, setChoice] = useState(null);
+      const [amount, setAmount] = useState(10);
+      const [err, setErr] = useState("");
+      const [busy, setBusy] = useState(false);
+
+      const online = match.id != null; // false when the backend record isn't loaded
+      const load = async () => {
+        try {
+          const mkt = await apiFetch(`/bets/match/${match.id}`);
+          setMarket(mkt);
+          const mine = await apiFetch("/bets/me");
+          setMyBet(mine.bets.find(b => b.match_id === match.id) || null);
+        } catch (e) { setErr(e.message); }
+      };
+      useEffect(() => { if (online) load(); else setMyBet(null); }, [match.id]);
+
+      const placeBet = async (e) => {
+        e.preventDefault();
+        setErr(""); setBusy(true);
+        try {
+          const data = await apiFetch("/bets", {
+            method: "POST",
+            body: { match_id: match.id, bet_choice: choice, points_wagered: Number(amount) },
+          });
+          onBalance(data.balance);
+          await load();
+        } catch (e) { setErr(e.message); } finally { setBusy(false); }
+      };
+
+      const canBet = online && match.status === "upcoming";
+      const statusChip = {
+        upcoming: "bg-pitch-100 text-pitch-700",
+        live: "bg-amber-100 text-amber-700",
+        finished: "bg-pitch-700 text-white",
+      }[match.status] || "bg-pitch-100 text-pitch-700";
+      const outcomes = [
+        { key: "team1", label: match.team1, flag: flag(match.team1) },
+        { key: "draw", label: "Draw", flag: "🤝" },
+        { key: "team2", label: match.team2, flag: flag(match.team2) },
+      ];
+
+      return (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/40 p-0 sm:p-4" onClick={onClose}>
+          <div className="bg-pitch-50 w-full sm:max-w-md rounded-t-2xl sm:rounded-2xl shadow-2xl max-h-[92vh] overflow-y-auto"
+            onClick={e => e.stopPropagation()}>
+            {/* Header */}
+            <div className="bg-pitch-900 text-white p-4 rounded-t-2xl">
+              <div className="flex items-start justify-between">
+                <span className={`text-[11px] font-bold px-2 py-1 rounded-md ${statusChip}`}>{match.status.toUpperCase()}</span>
+                <button onClick={onClose} className="text-pitch-300 hover:text-white text-xl leading-none">✕</button>
+              </div>
+              <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 mt-3 text-center">
+                <div><div className="text-3xl flag">{flag(match.team1)}</div><div className="text-sm font-semibold mt-1">{match.team1}</div></div>
+                <div className="text-pitch-400 font-bold text-sm">vs</div>
+                <div><div className="text-3xl flag">{flag(match.team2)}</div><div className="text-sm font-semibold mt-1">{match.team2}</div></div>
+              </div>
+              <div className="text-center text-pitch-300 text-xs mt-3">
+                🗓️ {fmtMatchDateTime(match.match_date)} · 📍 {match.venue}
+              </div>
+              {match.result && (
+                <div className="text-center text-sm font-bold mt-2">🏁 Result: {resultLabel(match)}</div>
+              )}
+            </div>
+
+            <div className="p-4 space-y-5">
+              {!online && (
+                <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl p-3 text-sm">
+                  ⚠️ Can't reach the server, so live odds and betting aren't available right now.
+                  Make sure the backend is running, then reopen this match.
+                </div>
+              )}
+              {/* Betting market */}
+              {online && (
+              <section>
+                <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold mb-2">Betting market</h3>
+                <MarketBar market={market} match={match} />
+              </section>
+              )}
+
+              {/* My existing bet OR place-bet form */}
+              {online && (
+              <section>
+                {myBet === undefined ? (
+                  <p className="text-sm text-pitch-400">Loading…</p>
+                ) : myBet ? (
+                  <div className="bg-white rounded-xl border border-pitch-200 p-4">
+                    <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold mb-2">Your bet</h3>
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-pitch-900">{choiceLabel(match, myBet.bet_choice)}</span>
+                      <span className="text-pitch-700 font-bold">{myBet.points_wagered} pts</span>
+                    </div>
+                    <p className="text-xs text-pitch-400 mt-1">One bet per match — your wager is locked in.</p>
+                  </div>
+                ) : !canBet ? (
+                  <p className="text-sm text-pitch-500">Betting is closed for this match.</p>
+                ) : (
+                  <form onSubmit={placeBet} className="bg-white rounded-xl border border-pitch-200 p-4 space-y-3">
+                    <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold">Place a bet</h3>
+                    <div className="grid grid-cols-3 gap-2">
+                      {outcomes.map(o => (
+                        <button key={o.key} type="button" onClick={() => setChoice(o.key)}
+                          className={`px-1 py-2 rounded-lg border text-xs font-semibold flex flex-col items-center gap-1 transition
+                            ${choice === o.key ? "bg-pitch-700 text-white border-pitch-700" : "bg-white text-pitch-800 border-pitch-200 hover:bg-pitch-100"}`}>
+                          <span className="flag text-lg leading-none">{o.flag}</span>
+                          <span className="truncate w-full text-center">{shortName(o.label)}</span>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input type="number" min="1" max={user.points} value={amount}
+                        onChange={e => setAmount(e.target.value)}
+                        className="w-full px-3 py-2 rounded-lg border border-pitch-200 text-sm focus:outline-none focus:ring-2 focus:ring-pitch-400" />
+                      <span className="text-xs text-pitch-500 whitespace-nowrap">/ {user.points} pts</span>
+                    </div>
+                    {err && <div className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{err}</div>}
+                    <button type="submit" disabled={busy || !choice || Number(amount) < 1 || Number(amount) > user.points}
+                      className="w-full bg-pitch-700 hover:bg-pitch-800 disabled:opacity-40 text-white font-semibold py-2.5 rounded-lg transition">
+                      {busy ? "Placing…" : choice ? `Bet ${amount} pts on ${shortName(choiceLabel(match, choice))}` : "Pick an outcome"}
+                    </button>
+                  </form>
+                )}
+              </section>
+              )}
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ===============================================================
+    // TAB 4 — My Bets + Leaderboard
+    // ===============================================================
+    const OUTCOME_BADGE = {
+      pending: { label: "Pending", cls: "bg-pitch-100 text-pitch-600" },
+      won: { label: "Won", cls: "bg-green-100 text-green-700" },
+      lost: { label: "Lost", cls: "bg-red-100 text-red-700" },
+      refunded: { label: "Refunded", cls: "bg-amber-100 text-amber-700" },
+    };
+
+    function MyBets({ user }) {
+      const [data, setData] = useState(null);
+      const [board, setBoard] = useState([]);
+      const [err, setErr] = useState("");
+
+      useEffect(() => {
+        apiFetch("/bets/me").then(setData).catch(e => setErr(e.message));
+        apiFetch("/leaderboard").then(d => setBoard(d.leaderboard)).catch(() => {});
+      }, []);
+
+      const s = data && data.summary;
+      return (
+        <div className="space-y-6">
+          {/* Summary */}
+          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+            {[
+              { label: "Points balance", value: s ? s.balance : user.points, accent: true },
+              { label: "Bets placed", value: s ? s.total_bets : "—" },
+              { label: "Points wagered", value: s ? s.points_wagered : "—" },
+              { label: "Points earned", value: s ? s.points_earned : "—" },
+            ].map(c => (
+              <div key={c.label} className={`rounded-xl border p-4 ${c.accent ? "bg-pitch-700 text-white border-pitch-700" : "bg-white border-pitch-100"}`}>
+                <div className={`text-xs ${c.accent ? "text-pitch-200" : "text-pitch-500"}`}>{c.label}</div>
+                <div className="text-2xl font-extrabold">{c.value}</div>
+              </div>
+            ))}
+          </div>
+
+          <div className="grid lg:grid-cols-3 gap-6">
+            {/* Bets list */}
+            <div className="lg:col-span-2">
+              <h3 className="font-bold text-pitch-800 mb-3">Your bets</h3>
+              {err && <div className="text-sm text-red-600 mb-3">{err}</div>}
+              {data && data.bets.length === 0 && (
+                <div className="text-center text-pitch-500 bg-white rounded-xl border border-pitch-100 py-10">
+                  No bets yet — open a match on the Schedule tab to place one.
+                </div>
+              )}
+              <div className="space-y-2">
+                {data && data.bets.map(b => {
+                  const badge = OUTCOME_BADGE[b.outcome];
+                  return (
+                    <div key={b.id} className="bg-white rounded-xl border border-pitch-100 p-3 flex items-center gap-3">
+                      <div className="flex-1 min-w-0">
+                        <div className="font-semibold text-sm text-pitch-900 truncate">
+                          {flag(b.team1)} {shortName(b.team1)} <span className="text-pitch-300">vs</span> {shortName(b.team2)} {flag(b.team2)}
+                        </div>
+                        <div className="text-xs text-pitch-500 mt-0.5">
+                          {fmtMatchDateTime(b.match_date)} · Picked <strong>{choiceLabel(b, b.bet_choice)}</strong> · {b.points_wagered} pts
+                        </div>
+                      </div>
+                      <div className="text-right shrink-0">
+                        <span className={`text-[11px] font-bold px-2 py-1 rounded-md ${badge.cls}`}>{badge.label}</span>
+                        {b.outcome === "won" && <div className="text-green-600 font-bold text-sm mt-1">+{b.points_awarded}</div>}
+                        {b.outcome === "lost" && <div className="text-red-600 font-bold text-sm mt-1">−{b.points_wagered}</div>}
+                        {b.outcome === "refunded" && <div className="text-amber-600 font-bold text-sm mt-1">+{b.points_awarded}</div>}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Leaderboard */}
+            <div>
+              <h3 className="font-bold text-pitch-800 mb-3">🏆 Leaderboard</h3>
+              <div className="bg-white rounded-xl border border-pitch-100 overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="text-pitch-500 border-b border-pitch-100 text-xs">
+                      <th className="text-left font-semibold px-3 py-2 w-8">#</th>
+                      <th className="text-left font-semibold py-2">Family member</th>
+                      <th className="text-right font-semibold px-3 py-2">Points</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-pitch-50">
+                    {board.map(r => (
+                      <tr key={r.rank} className={r.username === user.username ? "bg-pitch-50" : ""}>
+                        <td className="px-3 py-2 text-pitch-400 font-medium">{r.rank}</td>
+                        <td className="py-2 font-medium text-pitch-900">
+                          {r.display_name}{r.username === user.username && <span className="text-pitch-400 text-xs"> (you)</span>}
+                        </td>
+                        <td className="px-3 py-2 text-right font-bold text-pitch-800">{r.points}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    // ---------------------------------------------------------------
+    // App shell + tabs
+    // ---------------------------------------------------------------
+    const TABS = [
+      { id: "schedule", label: "Schedule", icon: "📅" },
+      { id: "groups", label: "Groups", icon: "🏆" },
+      { id: "bracket", label: "Knockout", icon: "🗺️" },
+      { id: "mybets", label: "My Bets", icon: "🎲" }
+    ];
+
+    const emptyGroupPicks = () => {
+      const o = {};
+      GROUP_LETTERS.forEach(g => { o[g] = { first: null, second: null }; });
+      return o;
+    };
+
+    function App() {
+      const [user, setUser] = useState(null);          // logged-in user (null = logged out)
+      const [authReady, setAuthReady] = useState(false); // finished checking stored token
+      const [tab, setTab] = useState("schedule");
+      const [apiMatches, setApiMatches] = useState([]);  // matches from the backend
+      const [selectedMatch, setSelectedMatch] = useState(null);
+
+      // Bracket / group-pick state (local-only knockout planner)
+      const [groupPicks, setGroupPicks] = useState(emptyGroupPicks);
+      const [picks, setPicks] = useState({});
+      const setGroupPick = (g, slot, team) => {
+        setGroupPicks(prev => {
+          const cur = { ...prev[g] };
+          const other = slot === "first" ? "second" : "first";
+          cur[slot] = cur[slot] === team ? null : team;
+          if (cur[other] === team) cur[other] = null;
+          return { ...prev, [g]: cur };
+        });
+      };
+      const clearGroupPicks = () => setGroupPicks(emptyGroupPicks());
+      const pickWinner = (n, side) =>
+        setPicks(prev => ({ ...prev, [n]: prev[n] === side ? undefined : side }));
+      const clearPicks = () => setPicks({});
+
+      // On first load, restore the session from a stored JWT.
+      useEffect(() => {
+        if (!tokenStore.get()) { setAuthReady(true); return; }
+        apiFetch("/auth/me")
+          .then(d => setUser(d.user))
+          .catch(() => tokenStore.clear())
+          .finally(() => setAuthReady(true));
+      }, []);
+
+      // Once logged in, load all matches for the schedule / betting.
+      // Retries a few times so a sleeping free-tier backend (Render cold start)
+      // self-heals, and surfaces a real message instead of failing silently.
+      const [matchesError, setMatchesError] = useState("");
+      const loadMatches = async (attempt = 0) => {
+        try {
+          const d = await apiFetch("/matches");
+          const list = d.matches || [];
+          setApiMatches(list);
+          setMatchesError(
+            list.length === 0
+              ? "The server is reachable but returned no matches — the database may not be seeded yet."
+              : ""
+          );
+        } catch (e) {
+          if (attempt < 4) {
+            setMatchesError("Waking up the server… (retrying)");
+            setTimeout(() => loadMatches(attempt + 1), 2500 * (attempt + 1));
+          } else {
+            setMatchesError(`Couldn't load match data from the server: ${e.message}`);
+          }
+        }
+      };
+      useEffect(() => { if (user) loadMatches(0); }, [user]);
+
+      // Index API matches by team1|team2|date|time so the hardcoded schedule
+      // cards can find their backend record (id, status, result).
+      const apiIndex = useMemo(() => {
+        const idx = {};
+        apiMatches.forEach(m => {
+          const date = m.match_date.slice(0, 10), time = m.match_date.slice(11, 16);
+          idx[`${m.team1}|${m.team2}|${date}|${time}`] = m;
+        });
+        return idx;
+      }, [apiMatches]);
+
+      const setBalance = (points) => setUser(u => ({ ...u, points }));
+      const logout = () => { tokenStore.clear(); setUser(null); setTab("schedule"); };
+      const refreshUser = () => apiFetch("/auth/me").then(d => setUser(d.user)).catch(() => {});
+
+      if (!authReady) {
+        return <div className="min-h-screen flex items-center justify-center text-pitch-500">Loading…</div>;
+      }
+      if (!user) {
+        return <AuthScreen onAuthed={(u) => setUser(u)} />;
+      }
+
+      return (
+        <div className="min-h-screen">
+          {/* Header */}
+          <header className="bg-pitch-900 text-white">
+            <div className="max-w-[1400px] mx-auto px-4 py-3 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-3 min-w-0">
+                <span className="text-3xl">⚽</span>
+                <div className="min-w-0">
+                  <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight truncate">FIFA World Cup 2026™</h1>
+                  <p className="text-pitch-300 text-xs sm:text-sm truncate">Canada · Mexico · USA — Jun 11 – Jul 19, 2026</p>
+                </div>
+              </div>
+              {/* User + points */}
+              <div className="flex items-center gap-3 shrink-0">
+                <div className="text-right leading-tight">
+                  <div className="text-sm font-semibold">{user.display_name}</div>
+                  <div className="text-pitch-300 text-xs">@{user.username}</div>
+                </div>
+                <div className="bg-pitch-700 rounded-lg px-3 py-1.5 text-center">
+                  <div className="text-[10px] text-pitch-200 uppercase tracking-wide leading-none">Points</div>
+                  <div className="text-lg font-extrabold leading-tight">{user.points}</div>
+                </div>
+                <button onClick={logout} title="Log out"
+                  className="text-pitch-300 hover:text-white text-sm border border-pitch-700 rounded-lg px-3 py-2">Log out</button>
+              </div>
+            </div>
+            {/* Tabs */}
+            <div className="max-w-[1400px] mx-auto px-4">
+              <nav className="flex gap-1 overflow-x-auto">
+                {TABS.map(t => (
+                  <button key={t.id} onClick={() => setTab(t.id)}
+                    className={`px-4 sm:px-6 py-3 text-sm font-semibold rounded-t-lg transition flex items-center gap-2 whitespace-nowrap
+                      ${tab === t.id ? "bg-pitch-50 text-pitch-900" : "text-pitch-200 hover:bg-pitch-800"}`}>
+                    <span>{t.icon}</span>{t.label}
+                  </button>
+                ))}
+              </nav>
+            </div>
+          </header>
+
+          {/* Match-data connectivity banner */}
+          {matchesError && (
+            <div className="bg-amber-50 border-b border-amber-200 text-amber-800 text-sm px-4 py-2 text-center">
+              ⚠️ {matchesError}
+              <button onClick={() => loadMatches(0)} className="underline font-semibold ml-2">Retry</button>
+            </div>
+          )}
+
+          {/* Body */}
+          <main className="max-w-[1400px] mx-auto px-4 py-4">
+            {tab === "schedule" && <Schedule onOpenMatch={setSelectedMatch} apiIndex={apiIndex} />}
+            {tab === "groups" && <Groups />}
+            {tab === "bracket" && <Bracket groupPicks={groupPicks} setGroupPick={setGroupPick}
+              clearGroupPicks={clearGroupPicks} picks={picks} pickWinner={pickWinner} clearPicks={clearPicks} />}
+            {tab === "mybets" && <MyBets user={user} />}
+          </main>
+
+          <footer className="max-w-[1400px] mx-auto px-4 py-8 text-center text-xs text-pitch-400">
+            Prototype · Family betting game · Data from the official Dec 2025 draw & 2026 match schedule.
+          </footer>
+
+          {selectedMatch && (
+            <MatchModal
+              match={apiIndex[`${selectedMatch.team1}|${selectedMatch.team2}|${selectedMatch.match_date.slice(0,10)}|${selectedMatch.match_date.slice(11,16)}`] || selectedMatch}
+              user={user}
+              onClose={() => { setSelectedMatch(null); refreshUser(); }}
+              onBalance={setBalance} />
+          )}
+        </div>
+      );
+    }
+
+createRoot(document.getElementById("root")).render(<App />);

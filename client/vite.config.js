@@ -1,10 +1,12 @@
 import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
 
-// The app itself is a single self-contained index.html (React + Babel + Tailwind
-// via CDN). Vite bundles only /src/pwa.js (service-worker registration) and the
-// PWA plugin generates the service worker. In dev, /api is proxied to the
-// Express backend on :3001 (used when VITE_API_BASE_URL is not set).
+// The app is compiled by Vite: React is bundled, JSX is precompiled (no
+// in-browser Babel), and Tailwind is built to a CSS file — so the app loads
+// from our own domain with no third-party CDN dependency (important for
+// reliable loading in regions where CDNs like unpkg are slow/blocked).
+// In dev, /api is proxied to the Express backend on :3001.
 export default defineConfig({
   server: {
     port: 5173,
@@ -13,6 +15,7 @@ export default defineConfig({
     },
   },
   plugins: [
+    react(),
     VitePWA({
       registerType: "prompt", // we show our own "Update available" banner
       injectRegister: false, // we register manually in src/pwa.js
