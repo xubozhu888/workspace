@@ -17,7 +17,9 @@ export default defineConfig({
   plugins: [
     react(),
     VitePWA({
-      registerType: "prompt", // we show our own "Update available" banner
+      // Auto-update: a new deploy installs, activates immediately and reloads,
+      // so devices never get stuck on an old cached UI (no "tap to refresh").
+      registerType: "autoUpdate",
       injectRegister: false, // we register manually in src/pwa.js
       manifest: false, // we ship our own public/manifest.json
       includeAssets: ["icon-192.png", "icon-512.png", "manifest.json"],
@@ -25,6 +27,9 @@ export default defineConfig({
         // App shell precached on install so reopening is instant.
         globPatterns: ["**/*.{js,css,html,png,svg,ico,json,woff2}"],
         navigateFallback: "/index.html",
+        skipWaiting: true,
+        clientsClaim: true,
+        cleanupOutdatedCaches: true,
         runtimeCaching: [
           {
             // All API calls: always go to the network (never serve stale data),
@@ -38,22 +43,11 @@ export default defineConfig({
             },
           },
           {
-            // Local static assets: stale-while-revalidate.
+            // Static assets: stale-while-revalidate.
             urlPattern: ({ request }) =>
               ["style", "script", "image", "font"].includes(request.destination),
             handler: "StaleWhileRevalidate",
             options: { cacheName: "asset-cache" },
-          },
-          {
-            // CDN dependencies (React, Babel, Tailwind, emoji fonts) so the
-            // shell still loads offline after the first visit.
-            urlPattern: ({ url }) =>
-              ["unpkg.com", "cdn.tailwindcss.com", "cdn.jsdelivr.net"].includes(url.hostname),
-            handler: "StaleWhileRevalidate",
-            options: {
-              cacheName: "cdn-cache",
-              cacheableResponse: { statuses: [0, 200] },
-            },
           },
         ],
       },
