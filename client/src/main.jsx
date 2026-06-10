@@ -404,49 +404,19 @@ import "./pwa.js";
     // TAB 1 — Schedule
     // ---------------------------------------------------------------
     function Schedule({ onOpenMatch, apiIndex }) {
-      const [grp, setGrp] = useState("All");
-      const [date, setDate] = useState("All");
-
-      const filtered = useMemo(() =>
-        MATCHES
-          .filter(m => grp === "All" || m.grp === grp)
-          .filter(m => date === "All" || m.date === date)
-          .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time)),
-        [grp, date]);
-
       const byDate = useMemo(() => {
         const out = {};
-        filtered.forEach(m => { (out[m.date] = out[m.date] || []).push(m); });
+        [...MATCHES]
+          .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time))
+          .forEach(m => { (out[m.date] = out[m.date] || []).push(m); });
         return out;
-      }, [filtered]);
+      }, []);
 
       return (
         <div>
-          {/* Filters */}
-          <div className="space-y-3 mb-6">
-            <div>
-              <div className="text-xs uppercase tracking-wide text-pitch-600 font-semibold mb-2">Group</div>
-              <div className="flex flex-wrap gap-2">
-                <Pill active={grp === "All"} onClick={() => setGrp("All")}>All</Pill>
-                {GROUP_LETTERS.map(g =>
-                  <Pill key={g} active={grp === g} onClick={() => setGrp(g)}>Group {g}</Pill>)}
-              </div>
-            </div>
-            <div>
-              <div className="text-xs uppercase tracking-wide text-pitch-600 font-semibold mb-2">Date</div>
-              <div className="flex flex-wrap gap-2">
-                <Pill active={date === "All"} onClick={() => setDate("All")}>All</Pill>
-                {ALL_DATES.map(d =>
-                  <Pill key={d} active={date === d} onClick={() => setDate(d)}>{fmtDate(d)}</Pill>)}
-              </div>
-            </div>
-          </div>
-
-          <div className="text-sm text-pitch-600 mb-4">{filtered.length} match{filtered.length !== 1 ? "es" : ""}</div>
+          <div className="text-sm text-pitch-600 mb-4">All {MATCHES.length} group-stage matches</div>
 
           {/* Matches grouped by date */}
-          {Object.keys(byDate).length === 0 &&
-            <div className="text-center text-pitch-500 py-12">No matches for this filter.</div>}
 
           {Object.entries(byDate).map(([d, ms]) => (
             <div key={d} className="mb-8">
@@ -1149,42 +1119,30 @@ import "./pwa.js";
       }
 
       return (
-        <div className="min-h-screen">
+        <div className="min-h-screen pb-[calc(64px+env(safe-area-inset-bottom))]">
           {/* Header */}
           <header className="bg-pitch-900 text-white">
-            <div className="max-w-[1400px] mx-auto px-4 py-3 flex items-center justify-between gap-3">
-              <div className="flex items-center gap-3 min-w-0">
-                <span className="text-3xl">⚽</span>
+            <div className="max-w-[1400px] mx-auto px-4 py-3 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="text-2xl shrink-0">⚽</span>
                 <div className="min-w-0">
-                  <h1 className="text-xl sm:text-2xl font-extrabold tracking-tight truncate">FIFA World Cup 2026™</h1>
-                  <p className="text-pitch-300 text-xs sm:text-sm truncate">Canada · Mexico · USA — Jun 11 – Jul 19, 2026</p>
+                  <h1 className="text-base sm:text-2xl font-extrabold tracking-tight leading-tight truncate">World Cup 2026</h1>
+                  <p className="hidden sm:block text-pitch-300 text-xs sm:text-sm truncate">Family Bets · Jun 11 – Jul 19, 2026</p>
                 </div>
               </div>
               {/* User + points */}
-              <div className="flex items-center gap-3 shrink-0">
-                <div className="text-right leading-tight">
-                  <div className="text-sm font-semibold">{user.display_name}</div>
+              <div className="flex items-center gap-2 shrink-0">
+                <div className="hidden sm:block text-right leading-tight mr-1">
+                  <div className="text-sm font-semibold truncate max-w-[140px]">{user.display_name}</div>
                   <div className="text-pitch-300 text-xs">@{user.username}</div>
                 </div>
-                <div className="bg-pitch-700 rounded-lg px-3 py-1.5 text-center">
-                  <div className="text-[10px] text-pitch-200 uppercase tracking-wide leading-none">Points</div>
-                  <div className="text-lg font-extrabold leading-tight">{user.points}</div>
+                <div className="bg-pitch-700 rounded-lg px-2.5 py-1 text-center">
+                  <div className="text-[9px] text-pitch-200 uppercase tracking-wide leading-none">Points</div>
+                  <div className="text-base sm:text-lg font-extrabold leading-tight">{user.points}</div>
                 </div>
                 <button onClick={logout} title="Log out"
-                  className="text-pitch-300 hover:text-white text-sm border border-pitch-700 rounded-lg px-3 py-2">Log out</button>
+                  className="text-pitch-200 hover:text-white text-xs border border-pitch-700 rounded-lg px-2.5 py-2">Log out</button>
               </div>
-            </div>
-            {/* Tabs */}
-            <div className="max-w-[1400px] mx-auto px-4">
-              <nav className="flex gap-1 overflow-x-auto">
-                {TABS.map(t => (
-                  <button key={t.id} onClick={() => setTab(t.id)}
-                    className={`px-4 sm:px-6 py-3 text-sm font-semibold rounded-t-lg transition flex items-center gap-2 whitespace-nowrap
-                      ${tab === t.id ? "bg-pitch-50 text-pitch-900" : "text-pitch-200 hover:bg-pitch-800"}`}>
-                    <span>{t.icon}</span>{t.label}
-                  </button>
-                ))}
-              </nav>
             </div>
           </header>
 
@@ -1208,6 +1166,24 @@ import "./pwa.js";
           <footer className="max-w-[1400px] mx-auto px-4 py-8 text-center text-xs text-pitch-400">
             Prototype · Family betting game · Data from the official Dec 2025 draw & 2026 match schedule.
           </footer>
+
+          {/* Bottom tab bar — native-app style */}
+          <nav className="fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur border-t border-pitch-100 shadow-[0_-2px_12px_rgba(0,0,0,0.06)]"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
+            <div className="max-w-[1400px] mx-auto grid grid-cols-4">
+              {TABS.map(t => {
+                const active = tab === t.id;
+                return (
+                  <button key={t.id} onClick={() => setTab(t.id)}
+                    className="relative flex flex-col items-center justify-center gap-0.5 py-2 active:bg-pitch-50 transition">
+                    {active && <span className="absolute top-0 inset-x-6 h-0.5 bg-pitch-600 rounded-full" />}
+                    <span className={`text-xl leading-none ${active ? "" : "opacity-60"}`}>{t.icon}</span>
+                    <span className={`text-[11px] font-semibold ${active ? "text-pitch-700" : "text-pitch-400"}`}>{t.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </nav>
 
           {selectedMatch && (
             <MatchModal
