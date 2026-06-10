@@ -1,4 +1,5 @@
 require("dotenv").config();
+const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcryptjs");
@@ -234,8 +235,21 @@ app.get("/api/leaderboard", (req, res) => {
   res.json({ leaderboard });
 });
 
-// Railway health check hits this to confirm the app is up.
+// Health check.
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
+
+// Optionally serve the built React frontend from the same origin (single-service
+// deploys, e.g. Zeabur). Set CLIENT_DIST to the built client `dist` directory.
+// When unset (e.g. API-only on Render), this is skipped.
+const CLIENT_DIST = process.env.CLIENT_DIST;
+if (CLIENT_DIST) {
+  app.use(express.static(CLIENT_DIST));
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api/")) return next(); // let unmatched API routes 404
+    res.sendFile(path.join(CLIENT_DIST, "index.html"));
+  });
+  console.log(`[server] Serving frontend from ${CLIENT_DIST}`);
+}
 
 app.listen(PORT, () => {
   console.log(`[server] WC2026 betting API listening on http://localhost:${PORT}`);
