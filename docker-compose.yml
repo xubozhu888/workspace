@@ -1,0 +1,41 @@
+# One-command deploy for a Hong Kong VPS (or any Docker host).
+# The app (React frontend + Express API, one origin) runs behind Caddy, which
+# gets automatic HTTPS from Let's Encrypt. Data is a local SQLite file kept in a
+# named volume so it survives restarts.
+#
+# Set DOMAIN, JWT_SECRET and ADMIN_PASSWORD in a ".env" file next to this file,
+# then:  docker compose up -d --build
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      JWT_SECRET: ${JWT_SECRET}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      DATABASE_PATH: /data/bets.db
+      # To use Turso instead of the local SQLite file, set these two and the
+      # local file is ignored:
+      # TURSO_DATABASE_URL: ${TURSO_DATABASE_URL}
+      # TURSO_AUTH_TOKEN: ${TURSO_AUTH_TOKEN}
+    volumes:
+      - betsdata:/data
+    expose:
+      - "8080"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+volumes:
+  betsdata:
+  caddy_data:
+  caddy_config:
