@@ -235,6 +235,9 @@ app.get("/api/leaderboard", (req, res) => {
   res.json({ leaderboard });
 });
 
+// Lets the admin UI check the password before enabling admin mode.
+app.post("/api/admin/verify", adminRequired, (req, res) => res.json({ ok: true }));
+
 // Health check.
 app.get("/api/health", (req, res) => res.json({ status: "ok" }));
 

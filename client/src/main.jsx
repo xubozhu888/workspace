@@ -25,9 +25,15 @@ import "./pwa.js";
       set: (t) => localStorage.setItem("wc_token", t),
       clear: () => localStorage.removeItem("wc_token"),
     };
+    // Shared admin password (kept locally; the server validates it on each call).
+    const adminStore = {
+      get: () => localStorage.getItem("wc_admin_pw") || "",
+      set: (p) => localStorage.setItem("wc_admin_pw", p),
+      clear: () => localStorage.removeItem("wc_admin_pw"),
+    };
 
-    async function callApi(base, path, { method = "GET", body } = {}) {
-      const headers = { "Content-Type": "application/json" };
+    async function callApi(base, path, { method = "GET", body, headers: extra } = {}) {
+      const headers = { "Content-Type": "application/json", ...(extra || {}) };
       const tok = tokenStore.get();
       if (tok) headers.Authorization = `Bearer ${tok}`;
       const res = await fetch(base + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
@@ -786,13 +792,16 @@ import "./pwa.js";
       );
     }
 
-    function MatchModal({ match, user, onClose, onBalance }) {
+    function MatchModal({ match, user, onClose, onBalance, onResultSet }) {
       const [market, setMarket] = useState(null);
       const [myBet, setMyBet] = useState(undefined); // undefined=loading | null=none | object
       const [choice, setChoice] = useState(null);
       const [amount, setAmount] = useState(10);
       const [err, setErr] = useState("");
       const [busy, setBusy] = useState(false);
+      const [adminErr, setAdminErr] = useState("");
+      const [adminBusy, setAdminBusy] = useState(false);
+      const adminPw = adminStore.get(); // non-empty => admin mode is on
 
       const online = match.id != null; // false when the backend record isn't loaded
       const load = async () => {
@@ -816,6 +825,21 @@ import "./pwa.js";
           onBalance(data.balance);
           await load();
         } catch (e) { setErr(e.message); } finally { setBusy(false); }
+      };
+
+      // Admin: set the match result, which triggers the payout on the server.
+      const setResult = async (result, label) => {
+        if (!window.confirm(`Settle this match as "${label}"?\nThis pays out all bets and can't be undone.`)) return;
+        setAdminErr(""); setAdminBusy(true);
+        try {
+          await apiFetch(`/matches/${match.id}/result`, {
+            method: "PATCH",
+            headers: { "x-admin-password": adminPw },
+            body: { result },
+          });
+          if (onResultSet) onResultSet(); // refresh matches in the parent
+          onClose();                      // close + refresh balances
+        } catch (e) { setAdminErr(e.message); } finally { setAdminBusy(false); }
       };
 
       const canBet = online && match.status === "upcoming";
@@ -912,6 +936,27 @@ import "./pwa.js";
                 )}
               </section>
               )}
+
+              {/* Admin · set result (only shown when admin mode is on) */}
+              {online && adminPw && match.status !== "finished" && (
+                <section className="bg-pitch-900 text-white rounded-xl p-4 space-y-2">
+                  <h3 className="text-xs uppercase tracking-wide text-pitch-300 font-bold">🔧 Admin · set result</h3>
+                  <p className="text-[11px] text-pitch-300">Records the final score and pays out every bet on this match. Can't be undone.</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    {outcomes.map(o => {
+                      const label = o.key === "draw" ? "Draw" : `${shortName(o.label)} won`;
+                      return (
+                        <button key={o.key} disabled={adminBusy} onClick={() => setResult(o.key, label)}
+                          className="px-1 py-2 rounded-lg border border-pitch-700 bg-pitch-800 hover:bg-pitch-700 disabled:opacity-40 text-xs font-semibold flex flex-col items-center gap-1">
+                          <span className="flag text-lg leading-none">{o.flag}</span>
+                          <span className="truncate w-full text-center">{label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {adminErr && <div className="text-sm text-red-100 bg-red-900/50 rounded-lg px-3 py-2">{adminErr}</div>}
+                </section>
+              )}
             </div>
           </div>
         </div>
@@ -927,6 +972,57 @@ import "./pwa.js";
       lost: { label: "Lost", cls: "bg-red-100 text-red-700" },
       refunded: { label: "Refunded", cls: "bg-amber-100 text-amber-700" },
     };
+
+    // Admin toggle: enter the shared admin password (verified by the server) to
+    // unlock the "Set result" buttons inside each match.
+    function AdminPanel() {
+      const [pw, setPw] = useState("");
+      const [on, setOn] = useState(!!adminStore.get());
+      const [busy, setBusy] = useState(false);
+      const [err, setErr] = useState("");
+      const [open, setOpen] = useState(false);
+
+      const enable = async () => {
+        setErr(""); setBusy(true);
+        try {
+          await apiFetch("/admin/verify", { method: "POST", headers: { "x-admin-password": pw } });
+          adminStore.set(pw); setOn(true); setPw("");
+        } catch (e) { setErr(e.message); } finally { setBusy(false); }
+      };
+      const disable = () => { adminStore.clear(); setOn(false); };
+
+      return (
+        <div className="bg-white rounded-xl border border-pitch-100 p-4">
+          <button onClick={() => setOpen(o => !o)} className="w-full flex items-center justify-between text-left">
+            <span className="font-bold text-pitch-800">🔧 Admin</span>
+            <span className="text-pitch-400 text-sm">{on ? "ON" : (open ? "▲" : "▼")}</span>
+          </button>
+          {(open || on) && (
+            <div className="mt-3">
+              {on ? (
+                <div className="space-y-2">
+                  <p className="text-sm text-pitch-600">Admin mode is <strong className="text-pitch-800">on</strong>. Open any match on the Schedule tab and use the <strong>Set result</strong> buttons to settle it and pay out.</p>
+                  <button onClick={disable} className="text-sm font-medium text-red-600 hover:text-red-700 underline underline-offset-2">Turn off admin mode</button>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  <p className="text-sm text-pitch-600">Enter the admin password to settle match results from the app.</p>
+                  <div className="flex gap-2">
+                    <input type="password" value={pw} onChange={e => setPw(e.target.value)} placeholder="Admin password"
+                      className="flex-1 px-3 py-2 rounded-lg border border-pitch-200 text-sm focus:outline-none focus:ring-2 focus:ring-pitch-400" />
+                    <button onClick={enable} disabled={busy || !pw}
+                      className="bg-pitch-700 hover:bg-pitch-800 disabled:opacity-40 text-white font-semibold px-4 rounded-lg text-sm">
+                      {busy ? "…" : "Enable"}
+                    </button>
+                  </div>
+                  {err && <div className="text-sm text-red-600">{err}</div>}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      );
+    }
 
     function MyBets({ user }) {
       const [data, setData] = useState(null);
@@ -1018,6 +1114,8 @@ import "./pwa.js";
               </div>
             </div>
           </div>
+
+          <AdminPanel />
         </div>
       );
     }
@@ -1190,7 +1288,8 @@ import "./pwa.js";
               match={apiIndex[`${selectedMatch.team1}|${selectedMatch.team2}|${selectedMatch.match_date.slice(0,10)}|${selectedMatch.match_date.slice(11,16)}`] || selectedMatch}
               user={user}
               onClose={() => { setSelectedMatch(null); refreshUser(); }}
-              onBalance={setBalance} />
+              onBalance={setBalance}
+              onResultSet={() => { loadMatches(0); refreshUser(); }} />
           )}
         </div>
       );
