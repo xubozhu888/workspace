@@ -6,31 +6,27 @@ const { SEED_MATCHES } = require("./seed");
 // ---------------------------------------------------------------------------
 // Database backend
 //
-//  - If TURSO_DATABASE_URL is set → use Turso (free, persistent cloud SQLite)
-//    as an EMBEDDED REPLICA: a local cache file (DATABASE_PATH) kept in sync
-//    with the remote primary. Reads are local & fast; writes are forwarded to
-//    the remote, so data SURVIVES redeploys even on an ephemeral filesystem and
-//    NO paid volume is required. Free Turso tier is plenty for a family app.
+//  - If TURSO_DATABASE_URL is set → connect DIRECTLY to the Turso primary
+//    (remote mode): every read and write goes to the cloud DB. Data is
+//    persistent and shared, so it survives redeploys with no paid volume.
+//    (We deliberately avoid embedded-replica mode — `syncUrl` — because seeded
+//    writes were not landing in the remote DB there.)
 //
 //  - Otherwise → a plain local SQLite file (ideal for local dev). On a host
 //    with an ephemeral disk and no Turso, data would be lost on redeploy.
 //
-// Either way the CREATE TABLE IF NOT EXISTS statements below make startup
-// idempotent, so the schema self-initializes on a fresh database.
+// The CREATE TABLE IF NOT EXISTS statements below make startup idempotent, so
+// the schema self-initializes on a fresh database.
 // ---------------------------------------------------------------------------
 const TURSO_URL = process.env.TURSO_DATABASE_URL;
-const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, "..", "data.sqlite");
-fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 
 let db;
 if (TURSO_URL) {
-  db = new Database(DB_PATH, {
-    syncUrl: TURSO_URL,
-    authToken: process.env.TURSO_AUTH_TOKEN,
-  });
-  db.sync(); // pull existing rows from the remote primary on startup
-  console.log(`[db] Turso embedded replica at ${DB_PATH} (synced from remote primary)`);
+  db = new Database(TURSO_URL, { authToken: process.env.TURSO_AUTH_TOKEN });
+  console.log("[db] Connected to Turso primary (remote mode)");
 } else {
+  const DB_PATH = process.env.DATABASE_PATH || path.join(__dirname, "..", "data.sqlite");
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   db = new Database(DB_PATH);
   try { db.pragma("journal_mode = WAL"); } catch (_) {}
   console.log(`[db] Local SQLite at ${DB_PATH}`);
@@ -38,8 +34,7 @@ if (TURSO_URL) {
 try { db.pragma("foreign_keys = ON"); } catch (_) {}
 
 // Run each statement on its own — libsql does NOT support a multi-statement
-// string in a single exec() over a Turso embedded replica (it raises
-// "cannot rollback - no transaction is active").
+// string in a single exec() over a Turso connection.
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,19 +75,24 @@ const SCHEMA = [
 ];
 for (const stmt of SCHEMA) db.exec(stmt);
 
-// Seed all 104 matches on first run (writes forward to the Turso primary when
-// configured, so this only happens once across all deploys).
+// Seed all 104 matches on first run. Insert in chunks of multi-row VALUES so
+// it's a handful of round-trips to Turso (not 104) while staying well under
+// SQLite's bind-variable limit. INSERT OR IGNORE keeps it safe to re-run.
 const matchCount = db.prepare("SELECT COUNT(*) AS c FROM matches").get().c;
 if (matchCount === 0) {
-  // Direct INSERTs only — do NOT wrap in db.transaction(): interactive
-  // transactions do not reliably persist on a Turso embedded replica (they
-  // silently write nothing), while plain INSERTs forward to the primary fine.
-  // INSERT OR IGNORE keeps this safe to re-run.
-  const insert = db.prepare(`
-    INSERT OR IGNORE INTO matches (id, "group", team1, team2, match_date, venue, status, result)
-    VALUES (@id, @group, @team1, @team2, @match_date, @venue, @status, @result)
-  `);
-  for (const r of SEED_MATCHES) insert.run(r);
+  const tuple = "(?,?,?,?,?,?,?,?)";
+  const CHUNK = 50;
+  for (let i = 0; i < SEED_MATCHES.length; i += CHUNK) {
+    const slice = SEED_MATCHES.slice(i, i + CHUNK);
+    const sql =
+      `INSERT OR IGNORE INTO matches (id, "group", team1, team2, match_date, venue, status, result) VALUES ` +
+      slice.map(() => tuple).join(",");
+    const params = [];
+    for (const r of slice) {
+      params.push(r.id, r.group, r.team1, r.team2, r.match_date, r.venue, r.status, r.result);
+    }
+    db.prepare(sql).run(...params);
+  }
   const after = db.prepare("SELECT COUNT(*) AS c FROM matches").get().c;
   console.log(`[db] Seeded matches — table now has ${after} rows`);
 } else {
