@@ -32,6 +32,12 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 const VALID_CHOICES = ["team1", "draw", "team2"];
 
+// match_date is a naive "YYYY-MM-DDTHH:MM:SS" wall-clock time in US Eastern.
+// The whole 2026 tournament (Jun 11 – Jul 19) is in EDT (UTC-4), so the kickoff
+// instant in UTC is that time + 4h. Betting closes at kickoff.
+const ET_TO_UTC_MS = 4 * 60 * 60 * 1000;
+const matchStartMs = (m) => Date.parse(m.match_date + "Z") + ET_TO_UTC_MS;
+
 // ---------------------------------------------------------------------------
 // Auth
 // ---------------------------------------------------------------------------
@@ -71,22 +77,25 @@ app.get("/api/auth/me", authRequired, (req, res) => {
 // ---------------------------------------------------------------------------
 // Matches
 // ---------------------------------------------------------------------------
+const MATCH_COLS = `id, "group", team1, team2, match_date, venue, status, result, score1, score2`;
+
 app.get("/api/matches", (req, res) => {
-  const rows = db.prepare(`SELECT id, "group", team1, team2, match_date, venue, status, result FROM matches ORDER BY match_date, id`).all();
+  const rows = db.prepare(`SELECT ${MATCH_COLS} FROM matches ORDER BY match_date, id`).all();
   res.json({ matches: rows });
 });
 
 app.get("/api/matches/:id", (req, res) => {
-  const row = db.prepare(`SELECT id, "group", team1, team2, match_date, venue, status, result FROM matches WHERE id = ?`).get(req.params.id);
+  const row = db.prepare(`SELECT ${MATCH_COLS} FROM matches WHERE id = ?`).get(req.params.id);
   if (!row) return res.status(404).json({ error: "Match not found" });
   res.json({ match: row });
 });
 
-// Admin: set a result and settle all bets on the match.
+// Admin: record the final score, which derives the result and settles all bets.
 app.patch("/api/matches/:id/result", adminRequired, (req, res) => {
-  const { result } = req.body || {};
-  if (!["team1", "draw", "team2"].includes(result)) {
-    return res.status(400).json({ error: "result must be one of team1 | draw | team2" });
+  const { score1, score2 } = req.body || {};
+  const s1 = Number(score1), s2 = Number(score2);
+  if (!Number.isInteger(s1) || !Number.isInteger(s2) || s1 < 0 || s2 < 0) {
+    return res.status(400).json({ error: "score1 and score2 must be non-negative integers" });
   }
   const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(req.params.id);
   if (!match) return res.status(404).json({ error: "Match not found" });
@@ -94,8 +103,9 @@ app.patch("/api/matches/:id/result", adminRequired, (req, res) => {
     return res.status(409).json({ error: "Match already settled" });
   }
 
-  const settlement = settleMatch(match.id, result);
-  const updated = db.prepare(`SELECT id, "group", team1, team2, match_date, venue, status, result FROM matches WHERE id = ?`).get(match.id);
+  const result = s1 > s2 ? "team1" : s1 < s2 ? "team2" : "draw";
+  const settlement = settleMatch(match.id, result, s1, s2);
+  const updated = db.prepare(`SELECT ${MATCH_COLS} FROM matches WHERE id = ?`).get(match.id);
   res.json({ match: updated, settlement });
 });
 
@@ -103,7 +113,7 @@ app.patch("/api/matches/:id/result", adminRequired, (req, res) => {
 // transactions don't reliably persist on a Turso embedded replica). It's made
 // idempotent instead: a bet is never paid twice, and the match is marked
 // finished LAST, so a crash mid-settle leaves it safely re-runnable.
-function settleMatch(matchId, result) {
+function settleMatch(matchId, result, score1, score2) {
   const bets = db.prepare("SELECT * FROM bets WHERE match_id = ?").all(matchId);
   const total_pool = bets.reduce((s, b) => s + b.points_wagered, 0);
   const winningBets = bets.filter((b) => b.bet_choice === result);
@@ -136,7 +146,8 @@ function settleMatch(matchId, result) {
     settlement = { total_pool, winners: winningBets.length, total_winning_pool, mode: "payout" };
   }
 
-  db.prepare("UPDATE matches SET result = ?, status = 'finished' WHERE id = ?").run(result, matchId);
+  db.prepare("UPDATE matches SET result = ?, score1 = ?, score2 = ?, status = 'finished' WHERE id = ?")
+    .run(result, score1, score2, matchId);
   return settlement;
 }
 
@@ -156,6 +167,9 @@ app.post("/api/bets", authRequired, (req, res) => {
   const match = db.prepare("SELECT * FROM matches WHERE id = ?").get(match_id);
   if (!match) return res.status(404).json({ error: "Match not found" });
   if (match.status !== "upcoming") return res.status(409).json({ error: "Betting is closed for this match" });
+  if (Date.now() >= matchStartMs(match)) {
+    return res.status(409).json({ error: "Betting closed — the match has kicked off" });
+  }
 
   const existing = db.prepare("SELECT id FROM bets WHERE user_id = ? AND match_id = ?").get(req.user.id, match_id);
   if (existing) return res.status(409).json({ error: "You already placed a bet on this match" });
@@ -180,7 +194,7 @@ app.get("/api/bets/me", authRequired, (req, res) => {
   const rows = db
     .prepare(
       `SELECT b.id, b.match_id, b.bet_choice, b.points_wagered, b.created_at,
-              m."group" AS match_group, m.team1, m.team2, m.match_date, m.venue, m.status, m.result,
+              m."group" AS match_group, m.team1, m.team2, m.match_date, m.venue, m.status, m.result, m.score1, m.score2,
               p.points_awarded
        FROM bets b
        JOIN matches m ON m.id = b.match_id

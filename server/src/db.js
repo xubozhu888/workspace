@@ -75,6 +75,11 @@ const SCHEMA = [
 ];
 for (const stmt of SCHEMA) db.exec(stmt);
 
+// Idempotent migration: goal columns added after the initial schema.
+const matchCols = db.prepare("PRAGMA table_info(matches)").all().map((c) => c.name);
+if (!matchCols.includes("score1")) db.exec("ALTER TABLE matches ADD COLUMN score1 INTEGER");
+if (!matchCols.includes("score2")) db.exec("ALTER TABLE matches ADD COLUMN score2 INTEGER");
+
 // Seed all 104 matches on first run. Insert in chunks of multi-row VALUES so
 // it's a handful of round-trips to Turso (not 104) while staying well under
 // SQLite's bind-variable limit. INSERT OR IGNORE keeps it safe to re-run.

@@ -60,6 +60,19 @@ import "./pwa.js";
       if (!m.result) return "";
       return m.result === "draw" ? "Draw" : `${shortName(m.result === "team1" ? m.team1 : m.team2)} won`;
     }
+    // Kickoff instant: match_date is ET wall-clock; the 2026 tournament is all
+    // EDT (UTC-4), so real start in UTC is +4h. Betting closes at kickoff.
+    const ET_TO_UTC_MS = 4 * 60 * 60 * 1000;
+    const matchStartMs = (m) => Date.parse(m.match_date + "Z") + ET_TO_UTC_MS;
+    const startMsFromParts = (date, time) => Date.parse(`${date}T${time}:00Z`) + ET_TO_UTC_MS;
+    const hasScore = (m) => m && m.score1 != null && m.score2 != null;
+    const scoreText = (m) => (hasScore(m) ? `${m.score1}–${m.score2}` : "");
+    function fmtCountdown(ms) {
+      if (ms <= 0) return "now";
+      const s = Math.floor(ms / 1000), h = Math.floor(s / 3600), mn = Math.floor((s % 3600) / 60), sec = s % 60;
+      if (h >= 1) return `${h}h ${mn}m`;
+      return mn >= 1 ? `${mn}m ${sec}s` : `${sec}s`;
+    }
     function fmtMatchDateTime(iso) {
       // iso like 2026-06-11T15:00:00
       const date = iso.slice(0, 10), time = iso.slice(11, 16);
@@ -417,6 +430,9 @@ import "./pwa.js";
           .forEach(m => { (out[m.date] = out[m.date] || []).push(m); });
         return out;
       }, []);
+      // Re-render periodically so "Place bet" flips to "Closed" at kickoff.
+      const [, setTick] = useState(0);
+      useEffect(() => { const t = setInterval(() => setTick(n => n + 1), 30000); return () => clearInterval(t); }, []);
 
       return (
         <div>
@@ -441,6 +457,7 @@ import "./pwa.js";
                     venue: `${m.venue}, ${m.city}`, status: "upcoming", result: null,
                   };
                   const finished = api && api.status === "finished";
+                  const started = Date.now() >= startMsFromParts(m.date, m.time);
                   return (
                   <div key={i} onClick={() => onOpenMatch(open)}
                     className="bg-white rounded-xl border border-pitch-100 shadow-sm p-4 hover:shadow-md hover:border-pitch-300 transition cursor-pointer">
@@ -453,7 +470,9 @@ import "./pwa.js";
                     </div>
                     <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
                       <Team name={m.a} />
-                      <span className="text-pitch-300 font-bold text-sm px-1">vs</span>
+                      {finished && hasScore(api)
+                        ? <span className="font-extrabold text-pitch-900 px-1 whitespace-nowrap">{api.score1}<span className="text-pitch-300 mx-0.5">–</span>{api.score2}</span>
+                        : <span className="text-pitch-300 font-bold text-sm px-1">vs</span>}
                       <Team name={m.b} align="right" />
                     </div>
                     <div className="mt-3 pt-3 border-t border-pitch-50 flex items-center justify-between gap-2">
@@ -461,8 +480,8 @@ import "./pwa.js";
                         <span>📍</span><span className="font-medium text-pitch-700 truncate">{m.venue}</span>
                         <span>·</span><span className="truncate">{m.city}</span>
                       </div>
-                      <span className={`text-[11px] font-bold whitespace-nowrap shrink-0 ${finished ? "text-pitch-700" : "text-pitch-500"}`}>
-                        {finished ? `🏁 ${resultLabel(api)}` : "Place bet ›"}
+                      <span className={`text-[11px] font-bold whitespace-nowrap shrink-0 ${finished ? "text-pitch-700" : started ? "text-pitch-400" : "text-pitch-500"}`}>
+                        {finished ? `🏁 ${resultLabel(api)}` : started ? "🔒 Closed" : "Place bet ›"}
                       </span>
                     </div>
                   </div>
@@ -801,7 +820,15 @@ import "./pwa.js";
       const [busy, setBusy] = useState(false);
       const [adminErr, setAdminErr] = useState("");
       const [adminBusy, setAdminBusy] = useState(false);
+      const [g1, setG1] = useState("");
+      const [g2, setG2] = useState("");
       const adminPw = adminStore.get(); // non-empty => admin mode is on
+
+      // Live clock so betting closes exactly at kickoff while the modal is open.
+      const [now, setNow] = useState(Date.now());
+      useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
+      const startMs = matchStartMs(match);
+      const started = now >= startMs;
 
       const online = match.id != null; // false when the backend record isn't loaded
       const load = async () => {
@@ -827,22 +854,25 @@ import "./pwa.js";
         } catch (e) { setErr(e.message); } finally { setBusy(false); }
       };
 
-      // Admin: set the match result, which triggers the payout on the server.
-      const setResult = async (result, label) => {
-        if (!window.confirm(`Settle this match as "${label}"?\nThis pays out all bets and can't be undone.`)) return;
+      // Admin: record the final score → server derives the result and pays out.
+      const submitScore = async () => {
+        const s1 = parseInt(g1, 10), s2 = parseInt(g2, 10);
+        if (!(s1 >= 0) || !(s2 >= 0)) { setAdminErr("Enter goals for both teams."); return; }
+        const winner = s1 > s2 ? `${shortName(match.team1)} win` : s1 < s2 ? `${shortName(match.team2)} win` : "Draw";
+        if (!window.confirm(`Settle ${match.team1} ${s1}–${s2} ${match.team2}  (${winner})?\nThis pays out all bets and can't be undone.`)) return;
         setAdminErr(""); setAdminBusy(true);
         try {
           await apiFetch(`/matches/${match.id}/result`, {
             method: "PATCH",
             headers: { "x-admin-password": adminPw },
-            body: { result },
+            body: { score1: s1, score2: s2 },
           });
           if (onResultSet) onResultSet(); // refresh matches in the parent
           onClose();                      // close + refresh balances
         } catch (e) { setAdminErr(e.message); } finally { setAdminBusy(false); }
       };
 
-      const canBet = online && match.status === "upcoming";
+      const canBet = online && match.status === "upcoming" && !started;
       const statusChip = {
         upcoming: "bg-pitch-100 text-pitch-700",
         live: "bg-amber-100 text-amber-700",
@@ -866,14 +896,16 @@ import "./pwa.js";
               </div>
               <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 mt-3 text-center">
                 <div><div className="text-3xl flag">{flag(match.team1)}</div><div className="text-sm font-semibold mt-1">{match.team1}</div></div>
-                <div className="text-pitch-400 font-bold text-sm">vs</div>
+                <div>{hasScore(match)
+                  ? <div className="text-2xl font-extrabold whitespace-nowrap">{match.score1}<span className="text-pitch-400 mx-1">–</span>{match.score2}</div>
+                  : <div className="text-pitch-400 font-bold text-sm">vs</div>}</div>
                 <div><div className="text-3xl flag">{flag(match.team2)}</div><div className="text-sm font-semibold mt-1">{match.team2}</div></div>
               </div>
               <div className="text-center text-pitch-300 text-xs mt-3">
                 🗓️ {fmtMatchDateTime(match.match_date)} · 📍 {match.venue}
               </div>
-              {match.result && (
-                <div className="text-center text-sm font-bold mt-2">🏁 Result: {resultLabel(match)}</div>
+              {match.status === "finished" && (
+                <div className="text-center text-sm font-bold mt-2">🏁 Full time — {resultLabel(match)}</div>
               )}
             </div>
 
@@ -907,10 +939,19 @@ import "./pwa.js";
                     <p className="text-xs text-pitch-400 mt-1">One bet per match — your wager is locked in.</p>
                   </div>
                 ) : !canBet ? (
-                  <p className="text-sm text-pitch-500">Betting is closed for this match.</p>
+                  <div className="bg-white rounded-xl border border-pitch-200 p-4 text-sm text-pitch-600">
+                    {match.status === "finished"
+                      ? "Betting is closed — match finished."
+                      : started
+                        ? "⏱️ Betting is closed — the match has kicked off."
+                        : "Betting is closed for this match."}
+                  </div>
                 ) : (
                   <form onSubmit={placeBet} className="bg-white rounded-xl border border-pitch-200 p-4 space-y-3">
-                    <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold">Place a bet</h3>
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold">Place a bet</h3>
+                      <span className="text-[11px] text-pitch-500">⏱️ closes in {fmtCountdown(startMs - now)}</span>
+                    </div>
                     <div className="grid grid-cols-3 gap-2">
                       {outcomes.map(o => (
                         <button key={o.key} type="button" onClick={() => setChoice(o.key)}
@@ -937,23 +978,35 @@ import "./pwa.js";
               </section>
               )}
 
-              {/* Admin · set result (only shown when admin mode is on) */}
+              {/* Admin · enter final score (only shown when admin mode is on) */}
               {online && adminPw && match.status !== "finished" && (
-                <section className="bg-pitch-900 text-white rounded-xl p-4 space-y-2">
-                  <h3 className="text-xs uppercase tracking-wide text-pitch-300 font-bold">🔧 Admin · set result</h3>
-                  <p className="text-[11px] text-pitch-300">Records the final score and pays out every bet on this match. Can't be undone.</p>
-                  <div className="grid grid-cols-3 gap-2">
-                    {outcomes.map(o => {
-                      const label = o.key === "draw" ? "Draw" : `${shortName(o.label)} won`;
-                      return (
-                        <button key={o.key} disabled={adminBusy} onClick={() => setResult(o.key, label)}
-                          className="px-1 py-2 rounded-lg border border-pitch-700 bg-pitch-800 hover:bg-pitch-700 disabled:opacity-40 text-xs font-semibold flex flex-col items-center gap-1">
-                          <span className="flag text-lg leading-none">{o.flag}</span>
-                          <span className="truncate w-full text-center">{label}</span>
-                        </button>
-                      );
-                    })}
+                <section className="bg-pitch-900 text-white rounded-xl p-4 space-y-3">
+                  <h3 className="text-xs uppercase tracking-wide text-pitch-300 font-bold">🔧 Admin · enter final score</h3>
+                  <p className="text-[11px] text-pitch-300">Pays out every bet on this match. Can't be undone.</p>
+                  <div className="flex items-end justify-center gap-3">
+                    <div className="text-center">
+                      <div className="flag text-2xl leading-none">{flag(match.team1)}</div>
+                      <div className="text-[11px] text-pitch-300 mt-1 truncate max-w-[90px]">{shortName(match.team1)}</div>
+                      <input type="number" min="0" inputMode="numeric" value={g1} onChange={e => setG1(e.target.value)} placeholder="0"
+                        className="w-16 mt-1 text-center text-xl font-extrabold px-2 py-1 rounded-lg bg-pitch-800 border border-pitch-700 text-white focus:outline-none focus:ring-2 focus:ring-pitch-400" />
+                    </div>
+                    <span className="text-pitch-400 font-bold text-xl pb-2">–</span>
+                    <div className="text-center">
+                      <div className="flag text-2xl leading-none">{flag(match.team2)}</div>
+                      <div className="text-[11px] text-pitch-300 mt-1 truncate max-w-[90px]">{shortName(match.team2)}</div>
+                      <input type="number" min="0" inputMode="numeric" value={g2} onChange={e => setG2(e.target.value)} placeholder="0"
+                        className="w-16 mt-1 text-center text-xl font-extrabold px-2 py-1 rounded-lg bg-pitch-800 border border-pitch-700 text-white focus:outline-none focus:ring-2 focus:ring-pitch-400" />
+                    </div>
                   </div>
+                  {g1 !== "" && g2 !== "" && (
+                    <p className="text-center text-xs text-pitch-200">
+                      → {(+g1 > +g2) ? `${shortName(match.team1)} win` : (+g1 < +g2) ? `${shortName(match.team2)} win` : "Draw"}
+                    </p>
+                  )}
+                  <button onClick={submitScore} disabled={adminBusy || g1 === "" || g2 === ""}
+                    className="w-full bg-pitch-600 hover:bg-pitch-500 disabled:opacity-40 text-white font-semibold py-2 rounded-lg transition">
+                    {adminBusy ? "Settling…" : "Settle match"}
+                  </button>
                   {adminErr && <div className="text-sm text-red-100 bg-red-900/50 rounded-lg px-3 py-2">{adminErr}</div>}
                 </section>
               )}
@@ -1069,7 +1122,9 @@ import "./pwa.js";
                     <div key={b.id} className="bg-white rounded-xl border border-pitch-100 p-3 flex items-center gap-3">
                       <div className="flex-1 min-w-0">
                         <div className="font-semibold text-sm text-pitch-900 truncate">
-                          {flag(b.team1)} {shortName(b.team1)} <span className="text-pitch-300">vs</span> {shortName(b.team2)} {flag(b.team2)}
+                          {flag(b.team1)} {shortName(b.team1)} {hasScore(b)
+                            ? <span className="font-extrabold">{b.score1}–{b.score2}</span>
+                            : <span className="text-pitch-300">vs</span>} {shortName(b.team2)} {flag(b.team2)}
                         </div>
                         <div className="text-xs text-pitch-500 mt-0.5">
                           {fmtMatchDateTime(b.match_date)} · Picked <strong>{choiceLabel(b, b.bet_choice)}</strong> · {b.points_wagered} pts
