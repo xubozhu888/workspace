@@ -813,7 +813,7 @@ import "./pwa.js";
 
     function MatchModal({ match, user, onClose, onBalance, onResultSet }) {
       const [market, setMarket] = useState(null);
-      const [myBet, setMyBet] = useState(undefined); // undefined=loading | null=none | object
+      const [myBets, setMyBets] = useState(undefined); // undefined=loading | array (possibly empty)
       const [choice, setChoice] = useState(null);
       const [amount, setAmount] = useState(10);
       const [err, setErr] = useState("");
@@ -836,10 +836,10 @@ import "./pwa.js";
           const mkt = await apiFetch(`/bets/match/${match.id}`);
           setMarket(mkt);
           const mine = await apiFetch("/bets/me");
-          setMyBet(mine.bets.find(b => b.match_id === match.id) || null);
+          setMyBets(mine.bets.filter(b => b.match_id === match.id));
         } catch (e) { setErr(e.message); }
       };
-      useEffect(() => { if (online) load(); else setMyBet(null); }, [match.id]);
+      useEffect(() => { if (online) load(); else setMyBets([]); }, [match.id]);
 
       const placeBet = async (e) => {
         e.preventDefault();
@@ -850,7 +850,9 @@ import "./pwa.js";
             body: { match_id: match.id, bet_choice: choice, points_wagered: Number(amount) },
           });
           onBalance(data.balance);
-          await load();
+          await load();              // refresh the summary table + market
+          setChoice(null);          // reset the form so another bet can follow
+          setAmount(10);
         } catch (e) { setErr(e.message); } finally { setBusy(false); }
       };
 
@@ -924,20 +926,44 @@ import "./pwa.js";
               </section>
               )}
 
-              {/* My existing bet OR place-bet form */}
+              {/* Your existing bets on this match */}
+              {online && myBets !== undefined && myBets.length > 0 && (
+              <section>
+                <div className="bg-white rounded-xl border border-pitch-200 p-4">
+                  <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold mb-2">Your bets on this match</h3>
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-pitch-500 border-b border-pitch-100 text-xs">
+                        <th className="text-left font-semibold py-1">Outcome</th>
+                        <th className="text-right font-semibold py-1">Points Wagered</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-pitch-50">
+                      {myBets.map(b => (
+                        <tr key={b.id}>
+                          <td className="py-1.5 font-medium text-pitch-900">{choiceLabel(match, b.bet_choice)}</td>
+                          <td className="py-1.5 text-right font-bold text-pitch-700">{b.points_wagered} pts</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                    <tfoot>
+                      <tr className="border-t border-pitch-100">
+                        <td className="pt-1.5 text-pitch-600 font-semibold">Total wagered:</td>
+                        <td className="pt-1.5 text-right font-extrabold text-pitch-900">
+                          {myBets.reduce((s, b) => s + b.points_wagered, 0)} pts
+                        </td>
+                      </tr>
+                    </tfoot>
+                  </table>
+                </div>
+              </section>
+              )}
+
+              {/* Place-bet form — shown whenever betting is open, regardless of existing bets */}
               {online && (
               <section>
-                {myBet === undefined ? (
+                {myBets === undefined ? (
                   <p className="text-sm text-pitch-400">Loading…</p>
-                ) : myBet ? (
-                  <div className="bg-white rounded-xl border border-pitch-200 p-4">
-                    <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold mb-2">Your bet</h3>
-                    <div className="flex items-center justify-between">
-                      <span className="font-semibold text-pitch-900">{choiceLabel(match, myBet.bet_choice)}</span>
-                      <span className="text-pitch-700 font-bold">{myBet.points_wagered} pts</span>
-                    </div>
-                    <p className="text-xs text-pitch-400 mt-1">One bet per match — your wager is locked in.</p>
-                  </div>
                 ) : !canBet ? (
                   <div className="bg-white rounded-xl border border-pitch-200 p-4 text-sm text-pitch-600">
                     {match.status === "finished"
@@ -1115,30 +1141,56 @@ import "./pwa.js";
                   No bets yet — open a match on the Schedule tab to place one.
                 </div>
               )}
-              <div className="space-y-2">
-                {data && data.bets.map(b => {
-                  const badge = OUTCOME_BADGE[b.outcome];
-                  return (
-                    <div key={b.id} className="bg-white rounded-xl border border-pitch-100 p-3 flex items-center gap-3">
-                      <div className="flex-1 min-w-0">
-                        <div className="font-semibold text-sm text-pitch-900 truncate">
-                          {flag(b.team1)} {shortName(b.team1)} {hasScore(b)
-                            ? <span className="font-extrabold">{b.score1}–{b.score2}</span>
-                            : <span className="text-pitch-300">vs</span>} {shortName(b.team2)} {flag(b.team2)}
+              <div className="space-y-3">
+                {data && (() => {
+                  // Group bets by match, preserving the server's order of first
+                  // appearance, so multiple bets on one match sit together.
+                  const groups = [];
+                  const byId = {};
+                  for (const b of data.bets) {
+                    if (!byId[b.match_id]) { byId[b.match_id] = { match: b, bets: [] }; groups.push(byId[b.match_id]); }
+                    byId[b.match_id].bets.push(b);
+                  }
+                  return groups.map(g => {
+                    const m = g.match;
+                    const wagered = g.bets.reduce((s, b) => s + b.points_wagered, 0);
+                    const earned = g.bets.reduce((s, b) => s + (b.points_awarded || 0), 0);
+                    return (
+                      <div key={m.match_id} className="bg-white rounded-xl border border-pitch-100 overflow-hidden">
+                        <div className="px-3 py-2 border-b border-pitch-100 bg-pitch-50">
+                          <div className="font-semibold text-sm text-pitch-900 truncate">
+                            {flag(m.team1)} {shortName(m.team1)} {hasScore(m)
+                              ? <span className="font-extrabold">{m.score1}–{m.score2}</span>
+                              : <span className="text-pitch-300">vs</span>} {shortName(m.team2)} {flag(m.team2)}
+                          </div>
+                          <div className="text-xs text-pitch-500 mt-0.5">{fmtMatchDateTime(m.match_date)}</div>
                         </div>
-                        <div className="text-xs text-pitch-500 mt-0.5">
-                          {fmtMatchDateTime(b.match_date)} · Picked <strong>{choiceLabel(b, b.bet_choice)}</strong> · {b.points_wagered} pts
+                        <div className="divide-y divide-pitch-50">
+                          {g.bets.map(b => {
+                            const badge = OUTCOME_BADGE[b.outcome];
+                            return (
+                              <div key={b.id} className="px-3 py-2 flex items-center gap-3">
+                                <div className="flex-1 min-w-0 text-xs text-pitch-600">
+                                  Picked <strong className="text-pitch-900">{choiceLabel(b, b.bet_choice)}</strong> · {b.points_wagered} pts
+                                </div>
+                                <div className="text-right shrink-0 flex items-center gap-2">
+                                  <span className={`text-[11px] font-bold px-2 py-1 rounded-md ${badge.cls}`}>{badge.label}</span>
+                                  {b.outcome === "won" && <span className="text-green-600 font-bold text-sm">+{b.points_awarded}</span>}
+                                  {b.outcome === "lost" && <span className="text-red-600 font-bold text-sm">−{b.points_wagered}</span>}
+                                  {b.outcome === "refunded" && <span className="text-amber-600 font-bold text-sm">+{b.points_awarded}</span>}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                        <div className="px-3 py-2 border-t border-pitch-100 bg-pitch-50 flex justify-between text-xs">
+                          <span className="text-pitch-600 font-semibold">Subtotal</span>
+                          <span className="text-pitch-800 font-bold">Wagered {wagered} pts · Earned {earned} pts</span>
                         </div>
                       </div>
-                      <div className="text-right shrink-0">
-                        <span className={`text-[11px] font-bold px-2 py-1 rounded-md ${badge.cls}`}>{badge.label}</span>
-                        {b.outcome === "won" && <div className="text-green-600 font-bold text-sm mt-1">+{b.points_awarded}</div>}
-                        {b.outcome === "lost" && <div className="text-red-600 font-bold text-sm mt-1">−{b.points_wagered}</div>}
-                        {b.outcome === "refunded" && <div className="text-amber-600 font-bold text-sm mt-1">+{b.points_awarded}</div>}
-                      </div>
-                    </div>
-                  );
-                })}
+                    );
+                  });
+                })()}
               </div>
             </div>
 

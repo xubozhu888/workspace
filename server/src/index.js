@@ -171,14 +171,12 @@ app.post("/api/bets", authRequired, (req, res) => {
     return res.status(409).json({ error: "Betting closed — the match has kicked off" });
   }
 
-  const existing = db.prepare("SELECT id FROM bets WHERE user_id = ? AND match_id = ?").get(req.user.id, match_id);
-  if (existing) return res.status(409).json({ error: "You already placed a bet on this match" });
-
   const fresh = db.prepare("SELECT points FROM users WHERE id = ?").get(req.user.id);
   if (wager > fresh.points) return res.status(400).json({ error: "Not enough points" });
 
   // Direct writes (no db.transaction — see db.js note on Turso replicas).
-  // Insert the bet first: if it fails (e.g. duplicate), no points are deducted.
+  // Insert the bet first: if it fails, no points are deducted. Users may place
+  // multiple bets on the same match, including repeats on the same outcome.
   const info = db
     .prepare("INSERT INTO bets (user_id, match_id, bet_choice, points_wagered) VALUES (?, ?, ?, ?)")
     .run(req.user.id, match_id, bet_choice, wager);

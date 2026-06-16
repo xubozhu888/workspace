@@ -61,7 +61,6 @@ const SCHEMA = [
     bet_choice     TEXT NOT NULL,
     points_wagered INTEGER NOT NULL,
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE (user_id, match_id),
     FOREIGN KEY (user_id) REFERENCES users(id),
     FOREIGN KEY (match_id) REFERENCES matches(id)
   )`,
@@ -79,6 +78,36 @@ for (const stmt of SCHEMA) db.exec(stmt);
 const matchCols = db.prepare("PRAGMA table_info(matches)").all().map((c) => c.name);
 if (!matchCols.includes("score1")) db.exec("ALTER TABLE matches ADD COLUMN score1 INTEGER");
 if (!matchCols.includes("score2")) db.exec("ALTER TABLE matches ADD COLUMN score2 INTEGER");
+
+// Idempotent migration: drop the legacy UNIQUE(user_id, match_id) constraint so
+// a user can place multiple bets on the same match. SQLite can't drop a
+// constraint-backed index in place, so rebuild the table when it's still there.
+const hasUserMatchUnique = db.prepare("PRAGMA index_list(bets)").all().some((idx) => {
+  if (!idx.unique) return false;
+  const cols = db.prepare(`PRAGMA index_info("${idx.name}")`).all().map((c) => c.name);
+  return cols.length === 2 && cols.includes("user_id") && cols.includes("match_id");
+});
+if (hasUserMatchUnique) {
+  try { db.pragma("foreign_keys = OFF"); } catch (_) {}
+  try { db.pragma("legacy_alter_table = ON"); } catch (_) {} // keep payouts' FK pointing at "bets"
+  db.exec("ALTER TABLE bets RENAME TO bets_old");
+  db.exec(`CREATE TABLE bets (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    match_id       INTEGER NOT NULL,
+    bet_choice     TEXT NOT NULL,
+    points_wagered INTEGER NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (match_id) REFERENCES matches(id)
+  )`);
+  db.exec(`INSERT INTO bets (id, user_id, match_id, bet_choice, points_wagered, created_at)
+           SELECT id, user_id, match_id, bet_choice, points_wagered, created_at FROM bets_old`);
+  db.exec("DROP TABLE bets_old");
+  try { db.pragma("legacy_alter_table = OFF"); } catch (_) {}
+  try { db.pragma("foreign_keys = ON"); } catch (_) {}
+  console.log("[db] Migrated bets: removed UNIQUE(user_id, match_id)");
+}
 
 // Seed all 104 matches on first run. Insert in chunks of multi-row VALUES so
 // it's a handful of round-trips to Turso (not 104) while staying well under
