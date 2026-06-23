@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import { createRoot } from "react-dom/client";
 import "./index.css";
 import "./pwa.js";
@@ -55,6 +55,75 @@ import "./pwa.js";
         throw e;
       }
     }
+
+    // ---------------------------------------------------------------
+    // Cached data layer — in-memory GET cache (TTL) + in-flight dedup.
+    // Lives at module scope, so every tab/component shares one cache and one
+    // pending request per endpoint (e.g. match info is fetched once and reused
+    // by the schedule prefetch, the match modal, and the My Bets tab alike).
+    // ---------------------------------------------------------------
+    const DEFAULT_TTL = 5 * 60 * 1000; // 5 minutes
+    const _cache = new Map();    // path -> { ts, data }
+    const _inflight = new Map(); // path -> Promise (de-dupes concurrent GETs)
+
+    function getCached(path, ttl = DEFAULT_TTL) {
+      const hit = _cache.get(path);
+      return hit && Date.now() - hit.ts < ttl ? hit.data : undefined;
+    }
+    function setCached(path, data) { _cache.set(path, { ts: Date.now(), data }); }
+    function invalidate(path) { _cache.delete(path); _inflight.delete(path); }
+    function invalidatePrefix(prefix) {
+      for (const k of [..._cache.keys()]) if (k.startsWith(prefix)) _cache.delete(k);
+    }
+
+    // Cached GET. Concurrent callers for the same path share one network
+    // request; a fresh cached value skips the network entirely. `force` bypasses
+    // the cache (but still de-dupes against any in-flight forced fetch).
+    function cachedGet(path, { ttl = DEFAULT_TTL, force = false } = {}) {
+      if (!force) {
+        const hit = getCached(path, ttl);
+        if (hit !== undefined) return Promise.resolve(hit);
+      }
+      const pending = _inflight.get(path);
+      if (pending) return pending;
+      const p = apiFetch(path)
+        .then((data) => { setCached(path, data); _inflight.delete(path); return data; })
+        .catch((err) => { _inflight.delete(path); throw err; });
+      _inflight.set(path, p);
+      return p;
+    }
+
+    // Today's date (YYYY-MM-DD) in tournament time (ET = UTC-4 all of 2026).
+    const todayEtDate = () => new Date(Date.now() - ET_TO_UTC_MS).toISOString().slice(0, 10);
+
+    // Optimistically fold a freshly placed bet into the shared caches so every
+    // tab reflects it instantly; a background refresh reconciles exact values.
+    function optimisticAddBet(matchRecord, bet) {
+      const me = getCached("/bets/me", Infinity);
+      if (me && me.bets && me.summary) {
+        const enriched = {
+          ...bet,
+          match_group: matchRecord.group,
+          team1: matchRecord.team1, team2: matchRecord.team2,
+          match_date: matchRecord.match_date, venue: matchRecord.venue,
+          status: matchRecord.status, result: matchRecord.result,
+          score1: matchRecord.score1, score2: matchRecord.score2,
+          points_awarded: null, outcome: "pending",
+        };
+        const bets = [enriched, ...me.bets];
+        setCached("/bets/me", {
+          bets,
+          summary: {
+            ...me.summary,
+            total_bets: bets.length,
+            points_wagered: me.summary.points_wagered + bet.points_wagered,
+          },
+        });
+      }
+      // The aggregated market changed — drop it so the next read re-fetches.
+      invalidate(`/bets/match/${bet.match_id}`);
+    }
+
     const choiceLabel = (m, c) => (c === "draw" ? "Draw" : c === "team1" ? m.team1 : m.team2);
     function resultLabel(m) {
       if (!m.result) return "";
@@ -434,60 +503,115 @@ import "./pwa.js";
       const [, setTick] = useState(0);
       useEffect(() => { const t = setInterval(() => setTick(n => n + 1), 30000); return () => clearInterval(t); }, []);
 
+      // Split dates into past (collapsed accordion) vs today + upcoming, so the
+      // current day is prioritised at the top of the list.
+      const today = todayEtDate();
+      const dates = Object.keys(byDate); // already chronological (built from sorted list)
+      const pastDates = dates.filter(d => d < today);
+      const currentDates = dates.filter(d => d >= today);
+      const [showPast, setShowPast] = useState(false);
+
+      const containerRef = useRef(null);
+      const todayRef = useRef(null);
+
+      // On load, scroll to today's (or the next upcoming) matches.
+      useEffect(() => {
+        if (todayRef.current) todayRef.current.scrollIntoView({ block: "start" });
+      }, []);
+
+      // Prefetch the betting market for the match card currently at the top of
+      // the viewport, so opening its modal is instant. Re-observe when the
+      // rendered set changes (backend records arrive, past section toggles).
+      useEffect(() => {
+        const root = containerRef.current;
+        if (!root) return;
+        const cards = [...root.querySelectorAll("[data-mid]")];
+        if (!cards.length) return;
+        const io = new IntersectionObserver((entries) => {
+          const visible = entries
+            .filter(e => e.isIntersecting)
+            .sort((a, b) => a.boundingClientRect.top - b.boundingClientRect.top);
+          const mid = visible[0] && visible[0].target.getAttribute("data-mid");
+          if (mid) cachedGet(`/bets/match/${mid}`).catch(() => {});
+        }, { threshold: 0.25 });
+        cards.forEach(c => io.observe(c));
+        return () => io.disconnect();
+      }, [apiIndex, showPast, currentDates.length]);
+
+      const renderCard = (m, i) => {
+        const api = apiIndex[`${m.a}|${m.b}|${m.date}|${m.time}`];
+        // Always open the modal; if the backend record isn't loaded
+        // (server offline / still loading) pass a synthetic match so
+        // the window still opens and explains what's wrong.
+        const open = api || {
+          id: null, group: m.grp, team1: m.a, team2: m.b,
+          match_date: `${m.date}T${m.time}:00`,
+          venue: `${m.venue}, ${m.city}`, status: "upcoming", result: null,
+        };
+        const finished = api && api.status === "finished";
+        const started = Date.now() >= startMsFromParts(m.date, m.time);
+        return (
+          <div key={i} onClick={() => onOpenMatch(open)} data-mid={api ? api.id : undefined}
+            className="bg-white rounded-xl border border-pitch-100 shadow-sm p-4 hover:shadow-md hover:border-pitch-300 transition cursor-pointer">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2">
+                <GroupBadge g={m.grp} />
+                <span className="text-xs text-pitch-500">Group {m.grp}</span>
+              </div>
+              <span className="text-xs font-semibold text-pitch-700 bg-pitch-100 px-2 py-1 rounded-md">{fmtTime(m.time)}</span>
+            </div>
+            <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
+              <Team name={m.a} />
+              {finished && hasScore(api)
+                ? <span className="font-extrabold text-pitch-900 px-1 whitespace-nowrap">{api.score1}<span className="text-pitch-300 mx-0.5">–</span>{api.score2}</span>
+                : <span className="text-pitch-300 font-bold text-sm px-1">vs</span>}
+              <Team name={m.b} align="right" />
+            </div>
+            <div className="mt-3 pt-3 border-t border-pitch-50 flex items-center justify-between gap-2">
+              <div className="text-xs text-pitch-500 flex items-center gap-1 min-w-0">
+                <span>📍</span><span className="font-medium text-pitch-700 truncate">{m.venue}</span>
+                <span>·</span><span className="truncate">{m.city}</span>
+              </div>
+              <span className={`text-[11px] font-bold whitespace-nowrap shrink-0 ${finished ? "text-pitch-700" : started ? "text-pitch-400" : "text-pitch-500"}`}>
+                {finished ? `🏁 ${resultLabel(api)}` : started ? "🔒 Closed" : "Place bet ›"}
+              </span>
+            </div>
+          </div>
+        );
+      };
+
+      const renderGroup = (d) => (
+        <div key={d} className="mb-8">
+          <h3 className="text-lg font-bold text-pitch-800 mb-3 sticky top-0 bg-pitch-50/90 backdrop-blur py-1">
+            {fmtDate(d)} <span className="text-pitch-400 font-normal text-sm">· 2026</span>
+          </h3>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {byDate[d].map((m, i) => renderCard(m, i))}
+          </div>
+        </div>
+      );
+
       return (
-        <div>
+        <div ref={containerRef}>
           <div className="text-sm text-pitch-600 mb-4">All {MATCHES.length} group-stage matches</div>
 
-          {/* Matches grouped by date */}
+          {/* Past dates — auto-collapsed into an expandable accordion */}
+          {pastDates.length > 0 && (
+            <div className="mb-8">
+              <button onClick={() => setShowPast(s => !s)}
+                className="w-full flex items-center gap-2 text-left text-lg font-bold text-pitch-800 mb-3">
+                <span className="text-pitch-400">{showPast ? "▾" : "▸"}</span>
+                Past matches
+                <span className="text-pitch-400 font-normal text-sm">· {pastDates.length} day{pastDates.length > 1 ? "s" : ""}</span>
+              </button>
+              {showPast && pastDates.map(d => renderGroup(d))}
+            </div>
+          )}
 
-          {Object.entries(byDate).map(([d, ms]) => (
-            <div key={d} className="mb-8">
-              <h3 className="text-lg font-bold text-pitch-800 mb-3 sticky top-0 bg-pitch-50/90 backdrop-blur py-1">
-                {fmtDate(d)} <span className="text-pitch-400 font-normal text-sm">· 2026</span>
-              </h3>
-              <div className="grid gap-3 sm:grid-cols-2">
-                {ms.map((m, i) => {
-                  const api = apiIndex[`${m.a}|${m.b}|${m.date}|${m.time}`];
-                  // Always open the modal; if the backend record isn't loaded
-                  // (server offline / still loading) pass a synthetic match so
-                  // the window still opens and explains what's wrong.
-                  const open = api || {
-                    id: null, group: m.grp, team1: m.a, team2: m.b,
-                    match_date: `${m.date}T${m.time}:00`,
-                    venue: `${m.venue}, ${m.city}`, status: "upcoming", result: null,
-                  };
-                  const finished = api && api.status === "finished";
-                  const started = Date.now() >= startMsFromParts(m.date, m.time);
-                  return (
-                  <div key={i} onClick={() => onOpenMatch(open)}
-                    className="bg-white rounded-xl border border-pitch-100 shadow-sm p-4 hover:shadow-md hover:border-pitch-300 transition cursor-pointer">
-                    <div className="flex items-center justify-between mb-3">
-                      <div className="flex items-center gap-2">
-                        <GroupBadge g={m.grp} />
-                        <span className="text-xs text-pitch-500">Group {m.grp}</span>
-                      </div>
-                      <span className="text-xs font-semibold text-pitch-700 bg-pitch-100 px-2 py-1 rounded-md">{fmtTime(m.time)}</span>
-                    </div>
-                    <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2">
-                      <Team name={m.a} />
-                      {finished && hasScore(api)
-                        ? <span className="font-extrabold text-pitch-900 px-1 whitespace-nowrap">{api.score1}<span className="text-pitch-300 mx-0.5">–</span>{api.score2}</span>
-                        : <span className="text-pitch-300 font-bold text-sm px-1">vs</span>}
-                      <Team name={m.b} align="right" />
-                    </div>
-                    <div className="mt-3 pt-3 border-t border-pitch-50 flex items-center justify-between gap-2">
-                      <div className="text-xs text-pitch-500 flex items-center gap-1 min-w-0">
-                        <span>📍</span><span className="font-medium text-pitch-700 truncate">{m.venue}</span>
-                        <span>·</span><span className="truncate">{m.city}</span>
-                      </div>
-                      <span className={`text-[11px] font-bold whitespace-nowrap shrink-0 ${finished ? "text-pitch-700" : started ? "text-pitch-400" : "text-pitch-500"}`}>
-                        {finished ? `🏁 ${resultLabel(api)}` : started ? "🔒 Closed" : "Place bet ›"}
-                      </span>
-                    </div>
-                  </div>
-                  );
-                })}
-              </div>
+          {/* Today + upcoming, grouped by date */}
+          {currentDates.map((d, idx) => (
+            <div key={d} ref={idx === 0 ? todayRef : undefined}>
+              {renderGroup(d)}
             </div>
           ))}
         </div>
@@ -777,7 +901,26 @@ import "./pwa.js";
     // ===============================================================
     // Match detail + betting modal
     // ===============================================================
-    function MarketBar({ market, match }) {
+    // Skeleton placeholder shown while a match's odds are being fetched.
+    function MarketSkeleton() {
+      return (
+        <div className="space-y-2 animate-pulse" aria-hidden="true">
+          {[0, 1, 2].map((i) => (
+            <div key={i}>
+              <div className="flex justify-between mb-1">
+                <span className="h-3 w-24 bg-pitch-100 rounded" />
+                <span className="h-3 w-14 bg-pitch-100 rounded" />
+              </div>
+              <div className="h-2.5 rounded-full bg-pitch-100" />
+            </div>
+          ))}
+          <div className="h-3 w-32 bg-pitch-100 rounded mt-1" />
+        </div>
+      );
+    }
+
+    function MarketBar({ market, match, loading }) {
+      if (loading) return <MarketSkeleton />;
       if (!market || market.total_bettors < 2) {
         return <p className="text-xs text-pitch-400">Market opens once at least 2 family members have bet.</p>;
       }
@@ -812,7 +955,9 @@ import "./pwa.js";
     }
 
     function MatchModal({ match, user, onClose, onBalance, onResultSet }) {
-      const [market, setMarket] = useState(null);
+      const marketPath = match.id != null ? `/bets/match/${match.id}` : null;
+      const [market, setMarket] = useState(() => (marketPath ? getCached(marketPath) ?? null : null));
+      const [marketLoading, setMarketLoading] = useState(() => (marketPath ? getCached(marketPath) === undefined : false));
       const [myBets, setMyBets] = useState(undefined); // undefined=loading | array (possibly empty)
       const [choice, setChoice] = useState(null);
       const [amount, setAmount] = useState(10);
@@ -831,15 +976,24 @@ import "./pwa.js";
       const started = now >= startMs;
 
       const online = match.id != null; // false when the backend record isn't loaded
-      const load = async () => {
+      // Lazy-load odds + the user's bets on open (tap), served from the shared
+      // cache when warm (e.g. prefetched by the schedule). `force` re-fetches.
+      const load = async (force = false) => {
         try {
-          const mkt = await apiFetch(`/bets/match/${match.id}`);
+          setMarketLoading(getCached(marketPath) === undefined);
+          const [mkt, mine] = await Promise.all([
+            cachedGet(marketPath, { force }),
+            cachedGet("/bets/me", { force }),
+          ]);
           setMarket(mkt);
-          const mine = await apiFetch("/bets/me");
-          setMyBets(mine.bets.filter(b => b.match_id === match.id));
+          setMyBets(mine.bets.filter((b) => b.match_id === match.id));
         } catch (e) { setErr(e.message); }
+        finally { setMarketLoading(false); }
       };
-      useEffect(() => { if (online) load(); else setMyBets([]); }, [match.id]);
+      useEffect(() => {
+        if (online) load();
+        else { setMyBets([]); setMarketLoading(false); }
+      }, [match.id]);
 
       const placeBet = async (e) => {
         e.preventDefault();
@@ -850,9 +1004,13 @@ import "./pwa.js";
             body: { match_id: match.id, bet_choice: choice, points_wagered: Number(amount) },
           });
           onBalance(data.balance);
-          await load();              // refresh the summary table + market
+          // Optimistic: show the new bet immediately and update the shared
+          // caches, then reconcile with the server in the background.
+          setMyBets((prev) => [...(prev || []), { ...data.bet }]);
+          optimisticAddBet(match, data.bet);
           setChoice(null);          // reset the form so another bet can follow
           setAmount(10);
+          load(true);               // background sync: authoritative market + bets
         } catch (e) { setErr(e.message); } finally { setBusy(false); }
       };
 
@@ -922,7 +1080,7 @@ import "./pwa.js";
               {online && (
               <section>
                 <h3 className="text-xs uppercase tracking-wide text-pitch-600 font-bold mb-2">Betting market</h3>
-                <MarketBar market={market} match={match} />
+                <MarketBar market={market} match={match} loading={marketLoading} />
               </section>
               )}
 
@@ -1052,6 +1210,47 @@ import "./pwa.js";
       refunded: { label: "Refunded", cls: "bg-amber-100 text-amber-700" },
     };
 
+    // One match's bets in the My Bets list: header, per-bet rows, and subtotal.
+    function BetGroupCard({ group }) {
+      const m = group.match;
+      const wagered = group.bets.reduce((s, b) => s + b.points_wagered, 0);
+      const earned = group.bets.reduce((s, b) => s + (b.points_awarded || 0), 0);
+      return (
+        <div className="bg-white rounded-xl border border-pitch-100 overflow-hidden">
+          <div className="px-3 py-2 border-b border-pitch-100 bg-pitch-50">
+            <div className="font-semibold text-sm text-pitch-900 truncate">
+              {flag(m.team1)} {shortName(m.team1)} {hasScore(m)
+                ? <span className="font-extrabold">{m.score1}–{m.score2}</span>
+                : <span className="text-pitch-300">vs</span>} {shortName(m.team2)} {flag(m.team2)}
+            </div>
+            <div className="text-xs text-pitch-500 mt-0.5">{fmtMatchDateTime(m.match_date)}</div>
+          </div>
+          <div className="divide-y divide-pitch-50">
+            {group.bets.map(b => {
+              const badge = OUTCOME_BADGE[b.outcome];
+              return (
+                <div key={b.id} className="px-3 py-2 flex items-center gap-3">
+                  <div className="flex-1 min-w-0 text-xs text-pitch-600">
+                    Picked <strong className="text-pitch-900">{choiceLabel(b, b.bet_choice)}</strong> · {b.points_wagered} pts
+                  </div>
+                  <div className="text-right shrink-0 flex items-center gap-2">
+                    <span className={`text-[11px] font-bold px-2 py-1 rounded-md ${badge.cls}`}>{badge.label}</span>
+                    {b.outcome === "won" && <span className="text-green-600 font-bold text-sm">+{b.points_awarded}</span>}
+                    {b.outcome === "lost" && <span className="text-red-600 font-bold text-sm">−{b.points_wagered}</span>}
+                    {b.outcome === "refunded" && <span className="text-amber-600 font-bold text-sm">+{b.points_awarded}</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div className="px-3 py-2 border-t border-pitch-100 bg-pitch-50 flex justify-between text-xs">
+            <span className="text-pitch-600 font-semibold">Subtotal</span>
+            <span className="text-pitch-800 font-bold">Wagered {wagered} pts · Earned {earned} pts</span>
+          </div>
+        </div>
+      );
+    }
+
     // Admin toggle: enter the shared admin password (verified by the server) to
     // unlock the "Set result" buttons inside each match.
     function AdminPanel() {
@@ -1103,19 +1302,108 @@ import "./pwa.js";
       );
     }
 
+    const MYBETS_PAGE = 20; // bets rendered per page (grows on scroll)
+    const ONE_DAY_MS = 24 * 60 * 60 * 1000; // "recent" window for settled results
     function MyBets({ user }) {
-      const [data, setData] = useState(null);
-      const [board, setBoard] = useState([]);
+      // Seed from the in-memory cache so revisiting the tab is instant.
+      const [data, setData] = useState(() => getCached("/bets/me") || null);
+      const [board, setBoard] = useState(() => getCached("/leaderboard")?.leaderboard || []);
       const [err, setErr] = useState("");
+      const [visible, setVisible] = useState(MYBETS_PAGE);
+      const [showPast, setShowPast] = useState(false);
+      const containerRef = useRef(null);
+      const sentinelRef = useRef(null);
 
-      useEffect(() => {
-        apiFetch("/bets/me").then(setData).catch(e => setErr(e.message));
-        apiFetch("/leaderboard").then(d => setBoard(d.leaderboard)).catch(() => {});
+      // Fetch latest payloads; `force` bypasses the cache TTL (focus/pull).
+      const refresh = useCallback((force) => {
+        cachedGet("/bets/me", { force }).then(setData).catch(e => setErr(e.message));
+        cachedGet("/leaderboard", { force }).then(d => setBoard(d.leaderboard)).catch(() => {});
       }, []);
 
+      // On mount (= switching to this tab): show cache, fetch only if stale.
+      useEffect(() => { refresh(false); }, [refresh]);
+
+      // Refresh when the tab/app regains focus.
+      useEffect(() => {
+        const onFocus = () => refresh(true);
+        const onVis = () => { if (document.visibilityState === "visible") refresh(true); };
+        window.addEventListener("focus", onFocus);
+        document.addEventListener("visibilitychange", onVis);
+        return () => {
+          window.removeEventListener("focus", onFocus);
+          document.removeEventListener("visibilitychange", onVis);
+        };
+      }, [refresh]);
+
+      // Pull-to-refresh: a downward drag while scrolled to the top re-fetches.
+      useEffect(() => {
+        const el = containerRef.current;
+        if (!el) return;
+        let startY = 0, pulling = false;
+        const ts = (e) => { if (window.scrollY <= 0) { startY = e.touches[0].clientY; pulling = true; } };
+        const tm = (e) => {
+          if (pulling && e.touches[0].clientY - startY > 70) { pulling = false; refresh(true); }
+        };
+        const te = () => { pulling = false; };
+        el.addEventListener("touchstart", ts, { passive: true });
+        el.addEventListener("touchmove", tm, { passive: true });
+        el.addEventListener("touchend", te);
+        return () => {
+          el.removeEventListener("touchstart", ts);
+          el.removeEventListener("touchmove", tm);
+          el.removeEventListener("touchend", te);
+        };
+      }, [refresh]);
+
+      // Infinite scroll: reveal another page of bets as the sentinel appears.
+      useEffect(() => {
+        const el = sentinelRef.current;
+        if (!el) return;
+        const io = new IntersectionObserver((entries) => {
+          if (entries.some(e => e.isIntersecting)) setVisible(v => v + MYBETS_PAGE);
+        });
+        io.observe(el);
+        return () => io.disconnect();
+      }, [data, visible]);
+
       const s = data && data.summary;
+
+      // Group bets by match, then split into recent vs older. Recent (shown by
+      // default, prioritised) = any ongoing/upcoming match plus results settled
+      // within the past day. Older finished results collapse into a section, so
+      // the default list stays small and fast.
+      const { recentGroups, olderGroups } = useMemo(() => {
+        const groups = [];
+        const byId = {};
+        for (const b of (data ? data.bets : [])) {
+          if (!byId[b.match_id]) { byId[b.match_id] = { match: b, bets: [] }; groups.push(byId[b.match_id]); }
+          byId[b.match_id].bets.push(b);
+        }
+        const now = Date.now();
+        const recent = [], older = [];
+        for (const g of groups) {
+          const m = g.match;
+          // Ongoing/upcoming (not yet settled) always count as recent; finished
+          // matches stay "recent" for a day after kickoff, then collapse.
+          const isRecent = m.status !== "finished" || now - matchStartMs(m) <= ONE_DAY_MS;
+          (isRecent ? recent : older).push(g);
+        }
+        return { recentGroups: recent, olderGroups: older };
+      }, [data]);
+
+      // Paginate the recent list: render whole match-groups until ~`visible`
+      // bets are shown (keeps subtotals correct), growing on scroll.
+      const shownRecent = [];
+      let recentCount = 0;
+      for (const g of recentGroups) {
+        if (recentCount >= visible) break;
+        shownRecent.push(g);
+        recentCount += g.bets.length;
+      }
+      const hasMoreRecent = shownRecent.length < recentGroups.length;
+
       return (
-        <div className="space-y-6">
+        <div className="space-y-6" ref={containerRef}>
           {/* Summary */}
           <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
             {[
@@ -1141,57 +1429,34 @@ import "./pwa.js";
                   No bets yet — open a match on the Schedule tab to place one.
                 </div>
               )}
+
+              {/* Recent bets — ongoing/upcoming + results from the past day */}
               <div className="space-y-3">
-                {data && (() => {
-                  // Group bets by match, preserving the server's order of first
-                  // appearance, so multiple bets on one match sit together.
-                  const groups = [];
-                  const byId = {};
-                  for (const b of data.bets) {
-                    if (!byId[b.match_id]) { byId[b.match_id] = { match: b, bets: [] }; groups.push(byId[b.match_id]); }
-                    byId[b.match_id].bets.push(b);
-                  }
-                  return groups.map(g => {
-                    const m = g.match;
-                    const wagered = g.bets.reduce((s, b) => s + b.points_wagered, 0);
-                    const earned = g.bets.reduce((s, b) => s + (b.points_awarded || 0), 0);
-                    return (
-                      <div key={m.match_id} className="bg-white rounded-xl border border-pitch-100 overflow-hidden">
-                        <div className="px-3 py-2 border-b border-pitch-100 bg-pitch-50">
-                          <div className="font-semibold text-sm text-pitch-900 truncate">
-                            {flag(m.team1)} {shortName(m.team1)} {hasScore(m)
-                              ? <span className="font-extrabold">{m.score1}–{m.score2}</span>
-                              : <span className="text-pitch-300">vs</span>} {shortName(m.team2)} {flag(m.team2)}
-                          </div>
-                          <div className="text-xs text-pitch-500 mt-0.5">{fmtMatchDateTime(m.match_date)}</div>
-                        </div>
-                        <div className="divide-y divide-pitch-50">
-                          {g.bets.map(b => {
-                            const badge = OUTCOME_BADGE[b.outcome];
-                            return (
-                              <div key={b.id} className="px-3 py-2 flex items-center gap-3">
-                                <div className="flex-1 min-w-0 text-xs text-pitch-600">
-                                  Picked <strong className="text-pitch-900">{choiceLabel(b, b.bet_choice)}</strong> · {b.points_wagered} pts
-                                </div>
-                                <div className="text-right shrink-0 flex items-center gap-2">
-                                  <span className={`text-[11px] font-bold px-2 py-1 rounded-md ${badge.cls}`}>{badge.label}</span>
-                                  {b.outcome === "won" && <span className="text-green-600 font-bold text-sm">+{b.points_awarded}</span>}
-                                  {b.outcome === "lost" && <span className="text-red-600 font-bold text-sm">−{b.points_wagered}</span>}
-                                  {b.outcome === "refunded" && <span className="text-amber-600 font-bold text-sm">+{b.points_awarded}</span>}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                        <div className="px-3 py-2 border-t border-pitch-100 bg-pitch-50 flex justify-between text-xs">
-                          <span className="text-pitch-600 font-semibold">Subtotal</span>
-                          <span className="text-pitch-800 font-bold">Wagered {wagered} pts · Earned {earned} pts</span>
-                        </div>
-                      </div>
-                    );
-                  });
-                })()}
+                {data && shownRecent.map(g => <BetGroupCard key={g.match.match_id} group={g} />)}
+                {hasMoreRecent && <div ref={sentinelRef} className="h-4" aria-hidden="true" />}
               </div>
+              {data && data.bets.length > 0 && recentGroups.length === 0 && (
+                <div className="text-center text-pitch-500 bg-white rounded-xl border border-pitch-100 py-8 text-sm">
+                  No recent or upcoming bets.
+                </div>
+              )}
+
+              {/* Older results — auto-collapsed into an expandable section */}
+              {data && olderGroups.length > 0 && (
+                <div className="mt-4">
+                  <button onClick={() => setShowPast(s => !s)}
+                    className="w-full flex items-center gap-2 text-left font-bold text-pitch-800 mb-3">
+                    <span className="text-pitch-400">{showPast ? "▾" : "▸"}</span>
+                    Older bets &amp; results
+                    <span className="text-pitch-400 font-normal text-sm">· {olderGroups.length} match{olderGroups.length > 1 ? "es" : ""}</span>
+                  </button>
+                  {showPast && (
+                    <div className="space-y-3">
+                      {olderGroups.map(g => <BetGroupCard key={g.match.match_id} group={g} />)}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* Leaderboard */}
@@ -1280,9 +1545,10 @@ import "./pwa.js";
       // Retries a few times so a sleeping free-tier backend (Render cold start)
       // self-heals, and surfaces a real message instead of failing silently.
       const [matchesError, setMatchesError] = useState("");
-      const loadMatches = async (attempt = 0) => {
+      const SCHEDULE_TTL = 15 * 60 * 1000; // reuse the cached schedule for 15 min
+      const loadMatches = async (attempt = 0, force = false) => {
         try {
-          const d = await apiFetch("/matches");
+          const d = await cachedGet("/matches", { ttl: SCHEDULE_TTL, force });
           const list = d.matches || [];
           setApiMatches(list);
           setMatchesError(
@@ -1293,13 +1559,19 @@ import "./pwa.js";
         } catch (e) {
           if (attempt < 4) {
             setMatchesError("Waking up the server… (retrying)");
-            setTimeout(() => loadMatches(attempt + 1), 2500 * (attempt + 1));
+            setTimeout(() => loadMatches(attempt + 1, force), 2500 * (attempt + 1));
           } else {
             setMatchesError(`Couldn't load match data from the server: ${e.message}`);
           }
         }
       };
       useEffect(() => { if (user) loadMatches(0); }, [user]);
+      // Auto-refresh the schedule every 15 min (served from cache until stale).
+      useEffect(() => {
+        if (!user) return;
+        const t = setInterval(() => loadMatches(0, true), SCHEDULE_TTL);
+        return () => clearInterval(t);
+      }, [user]);
 
       // Index API matches by team1|team2|date|time so the hardcoded schedule
       // cards can find their backend record (id, status, result).
@@ -1355,7 +1627,7 @@ import "./pwa.js";
           {matchesError && (
             <div className="bg-amber-50 border-b border-amber-200 text-amber-800 text-sm px-4 py-2 text-center">
               ⚠️ {matchesError}
-              <button onClick={() => loadMatches(0)} className="underline font-semibold ml-2">Retry</button>
+              <button onClick={() => loadMatches(0, true)} className="underline font-semibold ml-2">Retry</button>
             </div>
           )}
 
@@ -1396,7 +1668,14 @@ import "./pwa.js";
               user={user}
               onClose={() => { setSelectedMatch(null); refreshUser(); }}
               onBalance={setBalance}
-              onResultSet={() => { loadMatches(0); refreshUser(); }} />
+              onResultSet={() => {
+                // Settling pays out bets and changes status → drop dependent caches.
+                invalidate("/bets/me");
+                invalidate("/leaderboard");
+                invalidatePrefix("/bets/match/");
+                loadMatches(0, true);
+                refreshUser();
+              }} />
           )}
         </div>
       );
