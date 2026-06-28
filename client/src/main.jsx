@@ -127,7 +127,10 @@ import "./pwa.js";
     const choiceLabel = (m, c) => (c === "draw" ? "Draw" : c === "team1" ? m.team1 : m.team2);
     function resultLabel(m) {
       if (!m.result) return "";
-      return m.result === "draw" ? "Draw" : `${shortName(m.result === "team1" ? m.team1 : m.team2)} won`;
+      if (m.result === "draw") return "Draw";
+      // A level score with a team result means it was decided on penalties.
+      const pens = hasScore(m) && m.score1 === m.score2 ? " (pens)" : "";
+      return `${shortName(m.result === "team1" ? m.team1 : m.team2)} won${pens}`;
     }
     // Kickoff instant: match_date is ET wall-clock; the 2026 tournament is all
     // EDT (UTC-4), so real start in UTC is +4h. Betting closes at kickoff.
@@ -491,14 +494,37 @@ import "./pwa.js";
     // ---------------------------------------------------------------
     // TAB 1 — Schedule
     // ---------------------------------------------------------------
-    function Schedule({ onOpenMatch, apiIndex }) {
+    const KO_ROUND_NAME = {
+      R32: "Round of 32", R16: "Round of 16", QF: "Quarter-final",
+      SF: "Semi-final", Bronze: "Third place", Final: "Final",
+    };
+    const roundName = (code) => KO_ROUND_NAME[code] || code;
+
+    function Schedule({ onOpenMatch, apiIndex, apiMatches }) {
+      // Knockout matches whose teams are now known (resolved on the backend once
+      // the group stage ends). Normalised to the same shape as the hardcoded
+      // group fixtures, with a `stage` label instead of a group letter.
+      const koEntries = useMemo(() => (
+        (apiMatches || [])
+          .filter(m => !GROUP_LETTERS.includes(m.group) && TEAMS[m.team1] && TEAMS[m.team2])
+          .map(m => {
+            const date = m.match_date.slice(0, 10), time = m.match_date.slice(11, 16);
+            const ci = m.venue.indexOf(", ");
+            return {
+              date, time, a: m.team1, b: m.team2, stage: m.group,
+              venue: ci >= 0 ? m.venue.slice(0, ci) : m.venue,
+              city: ci >= 0 ? m.venue.slice(ci + 2) : "",
+            };
+          })
+      ), [apiMatches]);
+
       const byDate = useMemo(() => {
         const out = {};
-        [...MATCHES]
+        [...MATCHES, ...koEntries]
           .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time))
           .forEach(m => { (out[m.date] = out[m.date] || []).push(m); });
         return out;
-      }, []);
+      }, [koEntries]);
       // Re-render periodically so "Place bet" flips to "Closed" at kickoff.
       const [, setTick] = useState(0);
       useEffect(() => { const t = setInterval(() => setTick(n => n + 1), 30000); return () => clearInterval(t); }, []);
@@ -544,7 +570,7 @@ import "./pwa.js";
         // (server offline / still loading) pass a synthetic match so
         // the window still opens and explains what's wrong.
         const open = api || {
-          id: null, group: m.grp, team1: m.a, team2: m.b,
+          id: null, group: m.stage || m.grp, team1: m.a, team2: m.b,
           match_date: `${m.date}T${m.time}:00`,
           venue: `${m.venue}, ${m.city}`, status: "upcoming", result: null,
         };
@@ -555,8 +581,10 @@ import "./pwa.js";
             className="bg-white rounded-xl border border-pitch-100 shadow-sm p-4 hover:shadow-md hover:border-pitch-300 transition cursor-pointer">
             <div className="flex items-center justify-between mb-3">
               <div className="flex items-center gap-2">
-                <GroupBadge g={m.grp} />
-                <span className="text-xs text-pitch-500">Group {m.grp}</span>
+                {m.stage
+                  ? <span className="inline-flex items-center justify-center h-7 px-2 rounded-md bg-pitch-900 text-white text-[10px] font-bold shrink-0">{m.stage}</span>
+                  : <GroupBadge g={m.grp} />}
+                <span className="text-xs text-pitch-500">{m.stage ? roundName(m.stage) : `Group ${m.grp}`}</span>
               </div>
               <span className="text-xs font-semibold text-pitch-700 bg-pitch-100 px-2 py-1 rounded-md">{fmtTime(m.time)}</span>
             </div>
@@ -593,7 +621,9 @@ import "./pwa.js";
 
       return (
         <div ref={containerRef}>
-          <div className="text-sm text-pitch-600 mb-4">All {MATCHES.length} group-stage matches</div>
+          <div className="text-sm text-pitch-600 mb-4">
+            {MATCHES.length} group-stage matches{koEntries.length > 0 ? ` · ${koEntries.length} knockout matches` : ""}
+          </div>
 
           {/* Past dates — auto-collapsed into an expandable accordion */}
           {pastDates.length > 0 && (
@@ -967,7 +997,16 @@ import "./pwa.js";
       const [adminBusy, setAdminBusy] = useState(false);
       const [g1, setG1] = useState("");
       const [g2, setG2] = useState("");
+      const [shootoutWinner, setShootoutWinner] = useState(null); // "team1" | "team2"
       const adminPw = adminStore.get(); // non-empty => admin mode is on
+
+      // Knockout rounds (R32/R16/QF/SF/Bronze/Final) can't end level — a tie is
+      // decided by a penalty shootout. Group-stage games use a single letter.
+      const isKnockout = !!match.group && !/^[A-L]$/.test(match.group);
+      const tied = g1 !== "" && g2 !== "" && Number(g1) === Number(g2);
+      const needsShootout = isKnockout && tied;
+      // Drop a stale shootout pick once the score is no longer a knockout tie.
+      useEffect(() => { if (!needsShootout) setShootoutWinner(null); }, [needsShootout]);
 
       // Live clock so betting closes exactly at kickoff while the modal is open.
       const [now, setNow] = useState(Date.now());
@@ -1018,14 +1057,21 @@ import "./pwa.js";
       const submitScore = async () => {
         const s1 = parseInt(g1, 10), s2 = parseInt(g2, 10);
         if (!(s1 >= 0) || !(s2 >= 0)) { setAdminErr("Enter goals for both teams."); return; }
-        const winner = s1 > s2 ? `${shortName(match.team1)} win` : s1 < s2 ? `${shortName(match.team2)} win` : "Draw";
+        if (needsShootout && !shootoutWinner) {
+          setAdminErr("Tied knockout match — pick the penalty shootout winner.");
+          return;
+        }
+        const winner = s1 > s2 ? `${shortName(match.team1)} win`
+          : s1 < s2 ? `${shortName(match.team2)} win`
+          : needsShootout ? `${shortName(shootoutWinner === "team1" ? match.team1 : match.team2)} win on penalties`
+          : "Draw";
         if (!window.confirm(`Settle ${match.team1} ${s1}–${s2} ${match.team2}  (${winner})?\nThis pays out all bets and can't be undone.`)) return;
         setAdminErr(""); setAdminBusy(true);
         try {
           await apiFetch(`/matches/${match.id}/result`, {
             method: "PATCH",
             headers: { "x-admin-password": adminPw },
-            body: { score1: s1, score2: s2 },
+            body: { score1: s1, score2: s2, ...(needsShootout ? { shootout_winner: shootoutWinner } : {}) },
           });
           if (onResultSet) onResultSet(); // refresh matches in the parent
           onClose();                      // close + refresh balances
@@ -1182,12 +1228,36 @@ import "./pwa.js";
                         className="w-16 mt-1 text-center text-xl font-extrabold px-2 py-1 rounded-lg bg-pitch-800 border border-pitch-700 text-white focus:outline-none focus:ring-2 focus:ring-pitch-400" />
                     </div>
                   </div>
-                  {g1 !== "" && g2 !== "" && (
+                  {g1 !== "" && g2 !== "" && !needsShootout && (
                     <p className="text-center text-xs text-pitch-200">
                       → {(+g1 > +g2) ? `${shortName(match.team1)} win` : (+g1 < +g2) ? `${shortName(match.team2)} win` : "Draw"}
                     </p>
                   )}
-                  <button onClick={submitScore} disabled={adminBusy || g1 === "" || g2 === ""}
+                  {/* Knockout tie → admin picks the penalty shootout winner */}
+                  {needsShootout && (
+                    <div className="space-y-2">
+                      <p className="text-center text-[11px] text-pitch-300 font-semibold uppercase tracking-wide">
+                        Tied — penalty shootout winner
+                      </p>
+                      <div className="grid grid-cols-2 gap-2">
+                        {[{ key: "team1", name: match.team1 }, { key: "team2", name: match.team2 }].map(t => (
+                          <button key={t.key} type="button" onClick={() => setShootoutWinner(t.key)}
+                            className={`px-2 py-2 rounded-lg border text-xs font-semibold flex items-center justify-center gap-1.5 transition
+                              ${shootoutWinner === t.key ? "bg-pitch-600 text-white border-pitch-500" : "bg-pitch-800 text-pitch-100 border-pitch-700 hover:bg-pitch-700"}`}>
+                            <span className="flag text-base leading-none">{flag(t.name)}</span>
+                            <span className="truncate">{shortName(t.name)}</span>
+                            {shootoutWinner === t.key && <span className="text-[10px]">🏆</span>}
+                          </button>
+                        ))}
+                      </div>
+                      {shootoutWinner && (
+                        <p className="text-center text-xs text-pitch-200">
+                          → {shortName(shootoutWinner === "team1" ? match.team1 : match.team2)} win on penalties
+                        </p>
+                      )}
+                    </div>
+                  )}
+                  <button onClick={submitScore} disabled={adminBusy || g1 === "" || g2 === "" || (needsShootout && !shootoutWinner)}
                     className="w-full bg-pitch-600 hover:bg-pitch-500 disabled:opacity-40 text-white font-semibold py-2 rounded-lg transition">
                     {adminBusy ? "Settling…" : "Settle match"}
                   </button>
@@ -1633,7 +1703,7 @@ import "./pwa.js";
 
           {/* Body */}
           <main className="max-w-[1400px] mx-auto px-4 py-4">
-            {tab === "schedule" && <Schedule onOpenMatch={setSelectedMatch} apiIndex={apiIndex} />}
+            {tab === "schedule" && <Schedule onOpenMatch={setSelectedMatch} apiIndex={apiIndex} apiMatches={apiMatches} />}
             {tab === "groups" && <Groups />}
             {tab === "bracket" && <Bracket groupPicks={groupPicks} setGroupPick={setGroupPick}
               clearGroupPicks={clearGroupPicks} picks={picks} pickWinner={pickWinner} clearPicks={clearPicks} />}

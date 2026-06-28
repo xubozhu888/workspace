@@ -90,9 +90,15 @@ app.get("/api/matches/:id", (req, res) => {
   res.json({ match: row });
 });
 
+// Group-stage matches use a single letter (A–L); anything else is a knockout
+// round (R32/R16/QF/SF/Bronze/Final), which can't end level.
+const isKnockoutMatch = (m) => !/^[A-L]$/.test(m.group || "");
+
 // Admin: record the final score, which derives the result and settles all bets.
+// Knockout ties are decided by a penalty shootout: the admin passes
+// shootout_winner ("team1" | "team2") and that becomes the match result.
 app.patch("/api/matches/:id/result", adminRequired, (req, res) => {
-  const { score1, score2 } = req.body || {};
+  const { score1, score2, shootout_winner } = req.body || {};
   const s1 = Number(score1), s2 = Number(score2);
   if (!Number.isInteger(s1) || !Number.isInteger(s2) || s1 < 0 || s2 < 0) {
     return res.status(400).json({ error: "score1 and score2 must be non-negative integers" });
@@ -103,7 +109,19 @@ app.patch("/api/matches/:id/result", adminRequired, (req, res) => {
     return res.status(409).json({ error: "Match already settled" });
   }
 
-  const result = s1 > s2 ? "team1" : s1 < s2 ? "team2" : "draw";
+  let result;
+  if (s1 > s2) result = "team1";
+  else if (s1 < s2) result = "team2";
+  else if (isKnockoutMatch(match)) {
+    // Level score in a knockout game → a penalty shootout decides the winner.
+    if (shootout_winner !== "team1" && shootout_winner !== "team2") {
+      return res.status(400).json({ error: "This knockout match is tied — select the penalty shootout winner" });
+    }
+    result = shootout_winner;
+  } else {
+    result = "draw";
+  }
+
   const settlement = settleMatch(match.id, result, s1, s2);
   const updated = db.prepare(`SELECT ${MATCH_COLS} FROM matches WHERE id = ?`).get(match.id);
   res.json({ match: updated, settlement });

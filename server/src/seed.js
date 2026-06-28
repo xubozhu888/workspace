@@ -96,24 +96,26 @@ const GROUP_MATCHES = [
   M("2026-06-27", "17:00", "L", "Croatia", "Ghana", "Philadelphia", "Lincoln Financial Field"),
 ];
 
-// ---- Knockout stage (placeholder teams until the groups finish) ----
+// ---- Knockout stage — Round of 32 fixtures (teams set after the group stage;
+// official 2026 bracket). Later rounds stay as "Winner Match N" placeholders
+// until those matches are played. (Slot each pairing resolves: see comments.)
 const R32 = [
-  { n: 73, a: "2nd Group A", b: "2nd Group B" },
-  { n: 74, a: "1st Group E", b: "Best 3rd A/B/C/D/F" },
-  { n: 75, a: "1st Group F", b: "2nd Group C" },
-  { n: 76, a: "1st Group C", b: "2nd Group F" },
-  { n: 77, a: "1st Group I", b: "Best 3rd C/D/F/G/H" },
-  { n: 78, a: "2nd Group E", b: "2nd Group I" },
-  { n: 79, a: "1st Group A", b: "Best 3rd C/E/F/H/I" },
-  { n: 80, a: "1st Group L", b: "Best 3rd E/H/I/J/K" },
-  { n: 81, a: "1st Group D", b: "Best 3rd B/E/F/I/J" },
-  { n: 82, a: "1st Group G", b: "Best 3rd A/E/H/I/J" },
-  { n: 83, a: "2nd Group K", b: "2nd Group L" },
-  { n: 84, a: "1st Group H", b: "2nd Group J" },
-  { n: 85, a: "1st Group B", b: "Best 3rd E/F/G/I/J" },
-  { n: 86, a: "1st Group J", b: "2nd Group H" },
-  { n: 87, a: "1st Group K", b: "Best 3rd D/E/I/J/L" },
-  { n: 88, a: "2nd Group D", b: "2nd Group G" },
+  { n: 73, a: "South Africa", b: "Canada" },          // 2nd A vs 2nd B
+  { n: 74, a: "Germany", b: "Paraguay" },             // 1st E vs Best 3rd
+  { n: 75, a: "Netherlands", b: "Morocco" },          // 1st F vs 2nd C
+  { n: 76, a: "Brazil", b: "Japan" },                 // 1st C vs 2nd F
+  { n: 77, a: "France", b: "Sweden" },                // 1st I vs Best 3rd
+  { n: 78, a: "Ivory Coast", b: "Norway" },           // 2nd E vs 2nd I
+  { n: 79, a: "Mexico", b: "Ecuador" },               // 1st A vs Best 3rd
+  { n: 80, a: "England", b: "DR Congo" },             // 1st L vs Best 3rd
+  { n: 81, a: "USA", b: "Bosnia & Herzegovina" },     // 1st D vs Best 3rd
+  { n: 82, a: "Belgium", b: "Senegal" },              // 1st G vs Best 3rd
+  { n: 83, a: "Portugal", b: "Croatia" },             // 2nd K vs 2nd L
+  { n: 84, a: "Spain", b: "Austria" },                // 1st H vs 2nd J
+  { n: 85, a: "Switzerland", b: "Algeria" },          // 1st B vs Best 3rd
+  { n: 86, a: "Argentina", b: "Cape Verde" },         // 1st J vs 2nd H
+  { n: 87, a: "Colombia", b: "Ghana" },               // 1st K vs Best 3rd
+  { n: 88, a: "Australia", b: "Egypt" },              // 2nd D vs 2nd G
 ];
 const buildRound = (startN, count, feeders) =>
   Array.from({ length: count }, (_, i) => ({
